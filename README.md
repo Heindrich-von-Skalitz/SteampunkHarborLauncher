@@ -121,3 +121,7 @@ source\
   仅用于界面展示；详见 `THIRD_PARTY_NOTICES.md`。
 - 第三方库：PyQt6 / Qt（GPL-3.0）、minecraft-launcher-lib（BSD-2-Clause）
   等，完整说明见 `THIRD_PARTY_NOTICES.md`。
+
+## AI 生成内容披露
+
+该项目完全使用Deepseek-V4.1-flash和Deepseek Harness开发，无任何人工代码。
