@@ -4,23 +4,26 @@ import base64
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import (
-    QByteArray, QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal,
+    QByteArray, QEvent, QPoint, QRect, QRectF, QSize, Qt, QThread, QTimer, QUrl,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QLinearGradient,
     QPainter, QPainterPath, QPen, QPixmap, QRadialGradient,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QStackedWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QMainWindow, QMessageBox, QPushButton, QSizeGrip, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
 from ..constants import APP_BUILD_NAME, APP_NAME, APP_NAME_EN, APP_VERSION, THEME_NAMES
+from ..i18n import apply_language
 from ..core.installer import InstallerService
 from ..core.java import JavaInfo, JavaManager
 from ..core.launch import GameSession, LaunchBuilder, LaunchError, LaunchPlan
@@ -28,7 +31,7 @@ from ..core.minecraft import InstalledVersion, MinecraftManager
 from ..core.modpack import ModpackService, record_source
 from ..core.mods import ModManager
 from ..paths import (
-    app_icon_path, cache_dir, data_dir, ensure_launcher_metadata,
+    app_icon_path, cache_dir, data_dir, ensure_launcher_metadata, executable_dir,
     infer_game_dir_mode, logs_dir, project_root,
 )
 from ..services.microsoft import MicrosoftAuth, MicrosoftAuthError
@@ -50,6 +53,7 @@ from .pages.content import ContentPage
 from .pages.download import DownloadPage
 from .pages.home import HomePage
 from .pages.settings import SettingsPage
+from .pages.tasks import TasksPage
 from .pages.versions import VersionsPage
 from .tasks import TaskThread, run_task, shutdown_tasks
 from .theme import THEMES, Theme, ThemeManager
@@ -174,7 +178,7 @@ class TitleBar(QFrame):
         for key, text, icon_name in (
             ("home", "启动", "play"), ("download", "下载", "download_cloud"),
             ("versions", "版本", "layers"), ("content", "内容", "package"),
-            ("settings", "设置", "sliders"),
+            ("tasks", "任务", "list"), ("settings", "设置", "sliders"),
         ):
             button = make_button(text, "topnav", icon_name, "on_accent", 15)
             button.setMinimumWidth(76)
@@ -252,6 +256,8 @@ class TitleBar(QFrame):
 
 
 class MainWindow(QMainWindow):
+    hash_prompt_requested = pyqtSignal(object)
+
     def __init__(self) -> None:
         super().__init__()
         self.app = QApplication.instance()
@@ -310,11 +316,16 @@ class MainWindow(QMainWindow):
         self._refresh_all_icons()
         self.navigate("home", remember=False)
         self._update_footer()
+        self._version_watch_timer = QTimer(self)
+        self._version_watch_timer.setInterval(4000)
+        self._version_watch_timer.timeout.connect(self._refresh_versions_if_changed)
+        self._version_watch_timer.start()
         QTimer.singleShot(220, self._startup_tasks)
 
     # ------------------------------------------------------------------ setup
     def _init_state(self) -> None:
         self.versions = self.minecraft.scan()
+        self._version_snapshot = self._snapshot_versions()
         selected = str(self.settings.selected_version or "")
         valid_ids = {v.id for v in self.versions}
         if selected not in valid_ids:
@@ -396,17 +407,21 @@ class MainWindow(QMainWindow):
         self.download_page = DownloadPage(self, self.theme)
         self.versions_page = VersionsPage(self, self.theme)
         self.content_page = ContentPage(self, self.theme)
+        self.tasks_page = TasksPage(self, self.theme)
         self.settings_page = SettingsPage(self, self.theme)
         self.pages = {
             "home": self.home_page, "download": self.download_page,
             "versions": self.versions_page, "content": self.content_page,
-            "settings": self.settings_page,
+            "tasks": self.tasks_page, "settings": self.settings_page,
         }
         for page in self.pages.values():
             self.stack.addWidget(page)
         self.toast_host = ToastHost(self.shell_root)
         self.toast_host.setGeometry(self.shell_root.rect())
         self.toast_host.raise_()
+        self._download_tasks: dict[str, dict[str, object]] = {}
+        self._download_seq = 0
+        self._hash_prompts: dict[object, tuple[dict[str, object], threading.Event, dict[str, bool]]] = {}
         self._grips: list[ResizeGrip] = []
         self._create_grips()
         font = QFont(self.theme_manager.font_ui, 10)
@@ -414,7 +429,9 @@ class MainWindow(QMainWindow):
 
     def _connect_pages(self) -> None:
         self.download_page.manifest_ready.connect(self._manifest_page_ready)
+        self.hash_prompt_requested.connect(self._on_hash_prompt)
         self._update_account_chip()
+        apply_language(self, str(self.settings.get("language") or "zh_JT"))
 
     def _create_grips(self) -> None:
         specs = [
@@ -479,7 +496,74 @@ class MainWindow(QMainWindow):
         self._load_manifest_silent()
         self.rescan_java(silent=True)
 
+    def _ask_hash_decision(self, info: dict[str, object]) -> bool:
+        if QThread.currentThread() is self.thread():
+            return self._confirm_hash(info)
+        key = object()
+        event = threading.Event()
+        holder: dict[str, bool] = {}
+        self._hash_prompts[key] = (info, event, holder)
+        self.hash_prompt_requested.emit(key)
+        event.wait()
+        return bool(holder.get("ok", False))
+
+    def _on_hash_prompt(self, key: object) -> None:
+        entry = self._hash_prompts.pop(key, None)
+        if entry is None:
+            return
+        info, event, holder = entry
+        try:
+            holder["ok"] = self._confirm_hash(info)
+        finally:
+            event.set()
+
+    def _confirm_hash(self, info: dict[str, object]) -> bool:
+        missing = bool(info.get("missing"))
+        title = "缺少官方哈希" if missing else "哈希校验未通过"
+        expected = str(info.get("expected") or "官方未提供")
+        actual = str(info.get("actual") or "")
+        algorithm = str(info.get("algorithm") or "SHA-256")
+        url = str(info.get("url") or "")
+        text = (
+            f"文件：{info.get('label') or '安装组件'}\n"
+            f"期望哈希（{algorithm}）：{expected}\n"
+            f"实际哈希：{actual}\n"
+            f"下载源：{url}\n\n"
+            "哈希校验未通过。继续安装意味着你接受这个未验证的文件；"
+            "如果来源不可信，建议取消。"
+        )
+        return ConfirmDialog.ask(
+            self, self.theme, title, text, "仍然继续", danger=True)
+
     # ------------------------------------------------------------------ shell API
+    def begin_download_task(self, label: str) -> str:
+        key = f"download-{self._download_seq}"
+        self._download_seq += 1
+        self._download_tasks[key] = {
+            "label": label, "message": "准备中…", "percent": 0,
+        }
+        self._refresh_download_tasks()
+        return key
+
+    def update_download_task(self, key: str, percent: int | None = None,
+                             message: str = "") -> None:
+        task = self._download_tasks.get(key)
+        if task is None:
+            return
+        if percent is not None:
+            task["percent"] = max(0, min(100, int(percent)))
+        if message:
+            task["message"] = message
+        self._refresh_download_tasks()
+
+    def finish_download_task(self, key: str) -> None:
+        self._download_tasks.pop(key, None)
+        self._refresh_download_tasks()
+
+    def _refresh_download_tasks(self) -> None:
+        if hasattr(self, "tasks_page"):
+            self.tasks_page.set_tasks(self._download_tasks)
+
     def toast(self, text: str, kind: str = "info", duration: int = 3800) -> None:
         if hasattr(self, "toast_host"):
             self.toast_host.toast(text, kind, duration)
@@ -533,7 +617,7 @@ class MainWindow(QMainWindow):
         if button is None:
             return
         name = {"home": "play", "download": "download_cloud", "versions": "layers",
-                "content": "package", "settings": "sliders"}[key]
+                "content": "package", "tasks": "list", "settings": "sliders"}[key]
         role = "accent_lo" if active else "on_accent"
         color = self.theme.color(role)
         set_icon(button, name, role, 15)
@@ -573,6 +657,41 @@ class MainWindow(QMainWindow):
         self.refresh_all_versions()
         self.toast("版本扫描完成", "success")
 
+    def _snapshot_versions(self) -> dict[str, int]:
+        snapshot: dict[str, int] = {}
+        for version in self.versions:
+            try:
+                snapshot[version.id] = version.path.stat().st_mtime_ns
+            except OSError:
+                snapshot[version.id] = 0
+        return snapshot
+
+    def _refresh_versions_if_changed(self) -> None:
+        if getattr(self, "_version_refresh_busy", False):
+            return
+        try:
+            scanned = self.minecraft.scan()
+        except (OSError, LauncherError):
+            return
+        current: dict[str, int] = {}
+        for version in scanned:
+            try:
+                current[version.id] = version.path.stat().st_mtime_ns
+            except OSError:
+                current[version.id] = 0
+        if current == self._version_snapshot:
+            return
+        self._version_refresh_busy = True
+        try:
+            self.refresh_all_versions()
+        finally:
+            self._version_refresh_busy = False
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.WindowActivate:
+            QTimer.singleShot(120, self._refresh_versions_if_changed)
+        return super().event(event)
+
     def refresh_all_versions(self, select: str | None = None) -> None:
         old = select or self.current_version_id
         self.versions = self.minecraft.scan()
@@ -598,6 +717,7 @@ class MainWindow(QMainWindow):
                 self.content_page.refresh()
         if hasattr(self, "settings_page"):
             self.settings_page.refresh_paths()
+        self._version_snapshot = self._snapshot_versions()
         self._update_footer()
 
     def refresh_home_stats(self) -> None:
@@ -957,6 +1077,30 @@ class MainWindow(QMainWindow):
         else:
             self.toast("当前没有游戏日志窗口；启动游戏后会自动创建。", "info")
 
+    def _apply_new_version_language(self, version: InstalledVersion) -> None:
+        if not bool(self.settings.get("apply_language_to_new_versions", True)):
+            return
+        language = str(self.settings.get("language") or "zh_JT")
+        code = {"zh_JT": "zh_cn", "zh_FT": "zh_hk", "en": "en_us"}.get(language, "zh_cn")
+        try:
+            path = self.minecraft.game_dir(version) / "options.txt"
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines() \
+                if path.exists() else []
+            replaced = False
+            for index, line in enumerate(lines):
+                if line.startswith("lang:"):
+                    lines[index] = f"lang:{code}"
+                    replaced = True
+                    break
+            if not replaced:
+                lines.append(f"lang:{code}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            os.replace(temporary, path)
+        except OSError:
+            return
+
     # ------------------------------------------------------------------ installs
     def start_install(self, version_id: str, loader: str = "vanilla",
                       loader_version: str = "", display_name: str = "") -> None:
@@ -968,21 +1112,48 @@ class MainWindow(QMainWindow):
                 self.toast(f"安装已取消：需要 Java {required}+", "warning")
                 return
             java_path = str(java.path)
-        dialog = InstallDialog(self.theme, self.installer, version_id, loader=loader,
-                               loader_version=loader_version, java_path=java_path,
-                               parent=self)
-        accepted = dialog.run()
-        result = dialog.result_object
-        if accepted == QDialog.DialogCode.Accepted and result is not None:
+        task = self.begin_download_task(f"Minecraft {version_id}")
+        state = {"percent": 0}
+
+        def job(progress, cancel):
+            def report(percent, message):
+                state["percent"] = percent
+                progress((percent, message))
+
+            def log(message):
+                progress((state["percent"], message))
+
+            return self.installer.install(
+                version_id, loader=loader, loader_version=loader_version,
+                java_path=java_path, progress=report, log=log, cancel=cancel,
+                hash_decision=self._ask_hash_decision,
+            )
+
+        def progress(value: object) -> None:
+            if isinstance(value, tuple):
+                percent = int(value[0]) if value else 0
+                message = str(value[1]) if len(value) > 1 else ""
+                self.update_download_task(task, percent, message)
+
+        def done(result: object) -> None:
+            self.finish_download_task(task)
+            if result is None:
+                return
             installed_id = getattr(result, "id", version_id)
+            if isinstance(result, InstalledVersion):
+                self._apply_new_version_language(result)
             if display_name:
-                self.settings.save_version_profile(
-                    installed_id, {"display_name": display_name})
+                self.settings.save_version_profile(installed_id, {"display_name": display_name})
             self.refresh_all_versions(select=installed_id)
             self.toast(f"{version_id} 装配完成", "success")
             self.home_page.refresh_news()
-        else:
-            self.toast("安装没有完成", "info")
+
+        def failed(message: str) -> None:
+            self.finish_download_task(task)
+            self.toast(message, "error", 7000)
+
+        run_task(self, job, on_progress=progress, on_done=done, on_error=failed,
+                 on_cancelled=lambda: self.finish_download_task(task), name="game-install")
 
     def repair_version(self, version_id: str) -> None:
         def job(progress, cancel):
@@ -1037,6 +1208,420 @@ class MainWindow(QMainWindow):
             self.toast("版本设置已保存", "success")
 
     # ------------------------------------------------------------------ modrinth
+    def _install_modrinth_dependencies(self, version: dict[str, Any], directory: Path,
+                                       game_version: str, loader: str,
+                                       progress: Any, cancel: Any,
+                                       seen: set[str], depth: int = 0) -> None:
+        if depth > 4:
+            return
+        for dep in version.get("dependencies") or []:
+            if not isinstance(dep, dict) or dep.get("dependency_type") != "required":
+                continue
+            if cancel():
+                raise CancelledError("已取消安装前置")
+            dep_version: dict[str, Any] | None = None
+            project_id = str(dep.get("project_id") or "")
+            if dep.get("version_id"):
+                dep_version = self.modrinth.version_by_id(str(dep["version_id"]))
+                project_id = project_id or str(dep_version.get("project_id") or "")
+            elif project_id:
+                versions = self.modrinth.versions(
+                    project_id, game_version=game_version, loader=loader)
+                dep_version = self.modrinth.pick_version(versions)
+            if not project_id:
+                project_id = str((dep_version or {}).get("project_id") or "")
+            if not project_id or project_id in seen:
+                continue
+            seen.add(project_id)
+            if not dep_version:
+                raise LauncherError(f"找不到前置项目 {project_id} 的兼容版本。")
+            file = self.modrinth.primary_file(dep_version)
+            if not file:
+                raise LauncherError(f"前置项目 {project_id} 没有可下载文件。")
+            filename = Path(str(file.get("filename") or "dependency.jar")).name
+            target = directory / filename
+            if not target.exists():
+                sha1 = str((file.get("hashes") or {}).get("sha1") or "")
+                if not sha1:
+                    raise LauncherError(f"前置 {filename} 缺少 SHA-1，已拒绝下载。")
+                progress((18, f"安装前置 {filename}…"))
+
+                def dep_dl(done, total, name=filename):
+                    pct = 18 + int(done / max(1, total) * 4)
+                    progress((pct, f"前置 {name} · {format_size(done)} / {format_size(total)}"))
+
+                from ..utils import download_file
+                download_file(self.modrinth.file_urls(file), target, sha1=sha1,
+                              size=file.get("size") or None, progress=dep_dl,
+                              cancel=cancel, context=filename)
+            self._install_modrinth_dependencies(
+                dep_version, directory, game_version, loader, progress, cancel,
+                seen, depth + 1)
+
+    def _install_curseforge_dependencies(self, file: dict[str, Any], directory: Path,
+                                         game_version: str, loader: str,
+                                         progress: Any, cancel: Any,
+                                         seen: set[str], depth: int = 0) -> None:
+        if depth > 4:
+            return
+        for dep in file.get("dependencies") or []:
+            if not isinstance(dep, dict) or int(dep.get("relationType") or 0) != 3:
+                continue
+            project_id = str(dep.get("modId") or "")
+            if not project_id or project_id in seen:
+                continue
+            seen.add(project_id)
+            files = self.curseforge.files(
+                project_id, game_version=game_version, loader=loader)
+            chosen = self.curseforge.primary_file(files)
+            if not chosen:
+                raise LauncherError(f"找不到 CurseForge 前置 {project_id} 的兼容文件。")
+            filename = Path(str(chosen.get("fileName") or "dependency.jar")).name
+            target = directory / filename
+            if not target.exists():
+                progress((18, f"安装前置 {filename}…"))
+
+                def dep_dl(done, total, name=filename):
+                    pct = 18 + int(done / max(1, total) * 4)
+                    progress((pct, f"前置 {name} · {format_size(done)} / {format_size(total)}"))
+
+                self.curseforge.download(chosen, target, progress=dep_dl, cancel=cancel)
+            self._install_curseforge_dependencies(
+                chosen, directory, game_version, loader, progress, cancel,
+                seen, depth + 1)
+
+    def _resolve_modrinth_dep(self, dep: dict[str, Any], game_version: str,
+                              loader: str) -> tuple[dict[str, Any] | None, str]:
+        project_id = str(dep.get("project_id") or "")
+        version: dict[str, Any] | None = None
+        if dep.get("version_id"):
+            try:
+                version = self.modrinth.version_by_id(str(dep["version_id"]))
+                project_id = project_id or str(version.get("project_id") or "")
+            except Exception:
+                version = None
+            if version is not None:
+                game_versions = [str(item) for item in (version.get("game_versions") or [])]
+                loaders = [str(item) for item in (version.get("loaders") or [])]
+                if ((game_version and game_versions and game_version not in game_versions)
+                        or (loader and loaders and loader not in loaders)):
+                    version = None
+        if version is None and project_id:
+            for gv, ld in ((game_version, loader), (game_version, "")):
+                try:
+                    versions = self.modrinth.versions(project_id, game_version=gv, loader=ld)
+                    version = self.modrinth.pick_version(versions)
+                except Exception:
+                    version = None
+                if version is not None:
+                    break
+        if version is not None:
+            game_versions = [str(item) for item in (version.get("game_versions") or [])]
+            loaders = [str(item) for item in (version.get("loaders") or [])]
+            if game_version and game_versions and game_version not in game_versions:
+                version = None
+            elif loader and loaders and loader not in loaders:
+                version = None
+        return version, project_id
+
+    def _modrinth_project_dependencies(self, project_id: str, game_version: str,
+                                       loader: str) -> list[dict[str, Any]]:
+        try:
+            versions = self.modrinth.versions(
+                project_id, game_version=game_version, loader=loader)
+        except Exception:
+            return []
+        merged: dict[str, dict[str, Any]] = {}
+        for raw in versions[:12]:
+            for dep in (raw.get("dependencies") or []):
+                if not isinstance(dep, dict) or dep.get("dependency_type") != "required":
+                    continue
+                key = str(dep.get("project_id") or dep.get("version_id") or "")
+                if key:
+                    merged.setdefault(key, dep)
+        return list(merged.values())
+
+    def _plan_modrinth_mod(self, hit: dict[str, Any], version: InstalledVersion,
+                           chosen: dict[str, Any] | None = None) -> dict[str, Any]:
+        directory = self.minecraft.mods_dir(version, create=True)
+        game_version = version.base_version
+        loader = version.primary_loader if version.loaders else ""
+        project_id = str(hit.get("project_id") or hit.get("slug") or "")
+        if chosen is None:
+            versions = self.modrinth.versions(
+                project_id, game_version=game_version, loader=loader)
+            chosen = self.modrinth.pick_version(versions)
+        if not chosen:
+            raise LauncherError("Modrinth 上没有适用于当前版本的模组文件。")
+        file = self.modrinth.primary_file(chosen)
+        if not file:
+            raise LauncherError("这个模组版本没有可下载文件。")
+        items: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        seen: set[str] = {project_id}
+
+        def collect(raw: dict[str, Any], depth: int) -> None:
+            deps = [dep for dep in (raw.get("dependencies") or [])
+                    if isinstance(dep, dict) and dep.get("dependency_type") == "required"]
+            if len(deps) > 10:
+                warnings.append(f"单层前置超过 10 个（{len(deps)} 个），请谨慎安装。")
+            if depth >= 5:
+                if deps:
+                    warnings.append("前置嵌套超过 5 层，已停止继续解析。")
+                return
+            for dep in deps:
+                dep_version, dep_project = self._resolve_modrinth_dep(
+                    dep, game_version, loader)
+                if not dep_project or dep_project in seen:
+                    continue
+                seen.add(dep_project)
+                if dep_version is None:
+                    warnings.append(f"未能解析前置 {dep_project}，已跳过。")
+                    continue
+                dep_file = self.modrinth.primary_file(dep_version)
+                if not dep_file:
+                    warnings.append(f"前置 {dep_project} 没有可下载文件，已跳过。")
+                    continue
+                filename = Path(str(dep_file.get("filename") or "dependency.jar")).name
+                target = directory / filename
+                sha1 = str((dep_file.get("hashes") or {}).get("sha1") or "")
+                if not sha1:
+                    warnings.append(f"前置 {filename} 缺少 SHA-1，已跳过。")
+                    continue
+                if not target.exists():
+                    items.append({
+                        "urls": self.modrinth.file_urls(dep_file), "target": target,
+                        "sha1": sha1, "size": dep_file.get("size") or None,
+                        "label": f"前置：{filename}",
+                    })
+                collect(dep_version, depth + 1)
+
+        collect(chosen, 0)
+        required = [dep for dep in (chosen.get("dependencies") or [])
+                    if isinstance(dep, dict) and dep.get("dependency_type") == "required"]
+        if not required and project_id:
+            extras = self._modrinth_project_dependencies(project_id, game_version, loader)
+            if extras:
+                warnings.append("该版本未声明前置，已按同项目近期版本补全。")
+                collect({"dependencies": extras}, 0)
+        filename = Path(str(file.get("filename") or "download.bin")).name
+        target = directory / filename
+        sha1 = str((file.get("hashes") or {}).get("sha1") or "")
+        if not sha1:
+            raise LauncherError(f"{filename} 缺少 SHA-1。")
+        if not target.exists():
+            items.append({
+                "urls": self.modrinth.file_urls(file), "target": target,
+                "sha1": sha1, "size": file.get("size") or None,
+                "label": filename, "main": True,
+            })
+        return {"items": items, "warnings": warnings, "project": hit,
+                "version": version, "chosen": chosen, "file": file}
+
+    def _resolve_curseforge_dep(self, project_id: str, game_version: str,
+                                loader: str) -> dict[str, Any] | None:
+        for gv, ld in ((game_version, loader), (game_version, "")):
+            try:
+                chosen = self.curseforge.primary_file(self.curseforge.files(
+                    project_id, game_version=gv, loader=ld))
+            except Exception:
+                chosen = None
+            if chosen:
+                return chosen
+        return None
+
+    def _plan_curseforge_mod(self, hit: dict[str, Any], version: InstalledVersion,
+                             chosen: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.curseforge.enabled:
+            raise LauncherError("CurseForge 需要 API Key：设置 → 下载与网络。")
+        directory = self.minecraft.mods_dir(version, create=True)
+        game_version = version.base_version
+        loader = version.primary_loader if version.loaders else ""
+        project_id = str(hit.get("project_id") or "")
+        if chosen is None:
+            chosen = self.curseforge.primary_file(self.curseforge.files(
+                project_id, game_version=game_version, loader=loader))
+        if not chosen:
+            raise LauncherError("CurseForge 上没有适用于当前版本的模组文件。")
+        items: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        seen: set[str] = {project_id}
+
+        def collect(raw: dict[str, Any], depth: int) -> None:
+            deps = [dep for dep in (raw.get("dependencies") or [])
+                    if isinstance(dep, dict) and int(dep.get("relationType") or 0) == 3]
+            if len(deps) > 10:
+                warnings.append(f"单层前置超过 10 个（{len(deps)} 个），请谨慎安装。")
+            if depth >= 5:
+                if deps:
+                    warnings.append("前置嵌套超过 5 层，已停止继续解析。")
+                return
+            for dep in deps:
+                dep_project = str(dep.get("modId") or "")
+                if not dep_project or dep_project in seen:
+                    continue
+                seen.add(dep_project)
+                dep_file = self._resolve_curseforge_dep(
+                    dep_project, game_version, loader)
+                if not dep_file:
+                    warnings.append(f"未能解析 CurseForge 前置 {dep_project}，已跳过。")
+                    continue
+                filename = Path(str(dep_file.get("fileName") or "dependency.jar")).name
+                target = directory / filename
+                sha1 = self.curseforge.sha1(dep_file)
+                if not sha1:
+                    warnings.append(f"前置 {filename} 缺少 SHA-1，已跳过。")
+                    continue
+                if not target.exists():
+                    items.append({
+                        "urls": self.curseforge.file_urls(dep_file), "target": target,
+                        "sha1": sha1,
+                        "size": dep_file.get("fileLength") or None,
+                        "label": f"前置：{filename}",
+                    })
+                collect(dep_file, depth + 1)
+
+        collect(chosen, 0)
+        filename = Path(str(chosen.get("fileName") or "download.bin")).name
+        target = directory / filename
+        sha1 = self.curseforge.sha1(chosen)
+        if not sha1:
+            raise LauncherError(f"{filename} 缺少 SHA-1。")
+        if not target.exists():
+            items.append({
+                "urls": self.curseforge.file_urls(chosen), "target": target,
+                "sha1": sha1, "size": chosen.get("fileLength") or None,
+                "label": filename, "main": True,
+            })
+        return {"items": items, "warnings": warnings, "project": hit,
+                "version": version, "chosen": chosen, "file": chosen,
+                "source": "curseforge"}
+
+    def _set_card_busy(self, card: Any, busy: bool, text: str = "下载中…") -> None:
+        if card is None:
+            return
+        try:
+            from PyQt6 import sip
+            if sip.isdeleted(card):
+                return
+        except (RuntimeError, AttributeError, TypeError, ImportError):
+            pass
+        try:
+            card.set_installing(busy, text)
+        except (RuntimeError, AttributeError, TypeError):
+            return
+
+    def _begin_mod_plan(self, hit: dict[str, Any], version: InstalledVersion,
+                        card: Any, source: str,
+                        selected: dict[str, Any] | None = None) -> None:
+        task = self.begin_download_task(
+            str(hit.get("title") or hit.get("slug") or "模组下载"))
+        if card:
+            self._set_card_busy(card, True, "解析前置…")
+
+        def plan_job(progress, cancel):
+            progress((5, "解析模组与前置…"))
+            if source == "curseforge":
+                return self._plan_curseforge_mod(hit, version, selected)
+            return self._plan_modrinth_mod(hit, version, selected)
+
+        def planned(result: object) -> None:
+            if not isinstance(result, dict):
+                self.finish_download_task(task)
+                if card:
+                    self._set_card_busy(card, False)
+                return
+            items = result.get("items") or []
+            warnings = result.get("warnings") or []
+            if len(items) > 1 or warnings:
+                lines = [f"· {item['label']}" for item in items[:14]]
+                if len(items) > 14:
+                    lines.append(f"……另有 {len(items) - 14} 个文件")
+                text = (("\n".join(warnings) + "\n\n") if warnings else "") + (
+                    f"将下载 {len(items)} 个文件：\n" + "\n".join(lines) +
+                    "\n\n下载到当前实例的 mods 目录。")
+                if not ConfirmDialog.ask(
+                        self, self.theme,
+                        "确认下载模组与前置" if not warnings else "前置数量较多，请谨慎安装",
+                        text, "开始下载"):
+                    self.finish_download_task(task)
+                    if card:
+                        self._set_card_busy(card, False)
+                    return
+            self._download_mod_plan(result, card, task)
+
+        def failed(message: str) -> None:
+            self.finish_download_task(task)
+            if card:
+                self._set_card_busy(card, False)
+            self.toast(message, "error", 7000)
+
+        run_task(self, plan_job, on_done=planned, on_error=failed, name="mod-plan")
+
+    def download_mod_version_with_plan(self, hit: dict[str, Any], version: InstalledVersion,
+                                       selected: dict[str, Any] | None,
+                                       source: str) -> None:
+        self._begin_mod_plan(hit, version, None, source, selected)
+
+    def _download_mod_plan(self, plan: dict[str, Any], card: Any, task: str) -> None:
+        items = plan.get("items") or []
+        if not items:
+            self.finish_download_task(task)
+            if card:
+                self._set_card_busy(card, False)
+            self.toast("模组和前置均已存在。", "info")
+            return
+        if card:
+            self._set_card_busy(card, True, "下载中…")
+        self.update_download_task(task, 5, f"准备下载 {len(items)} 个文件")
+
+        def job(progress, cancel):
+            from ..utils import download_file
+            count = len(items)
+            for index, item in enumerate(items):
+                if cancel():
+                    raise CancelledError("已取消下载")
+                start = 8 + int(index / max(1, count) * 88)
+
+                def dl(done, total, base=start, name=str(item["label"])):
+                    progress((base, f"下载 {name} · "
+                                    f"{format_size(done)} / {format_size(total)}"))
+
+                progress((start, f"下载 {item['label']}…"))
+                download_file(item["urls"], item["target"], sha1=item["sha1"],
+                              size=item.get("size"), progress=dl, cancel=cancel,
+                              context=item["label"])
+            return plan
+
+        def done(result: object) -> None:
+            self.finish_download_task(task)
+            if card:
+                self._set_card_busy(card, False)
+            data = result if isinstance(result, dict) else plan
+            if data.get("source") != "curseforge":
+                main = next((item for item in items if item.get("main")), None)
+                if main and plan.get("version"):
+                    record_source(plan["version"], main["target"].name, plan["project"],
+                                  plan.get("chosen") or {}, plan.get("file") or {})
+            self.content_page.refresh()
+            self.refresh_home_stats()
+            self.toast(f"已下载 {len(items)} 个文件到 mods", "success")
+
+        def failed(message: str) -> None:
+            self.finish_download_task(task)
+            if card:
+                self._set_card_busy(card, False)
+            self.toast(message, "error", 7000)
+
+        def on_progress(value: object) -> None:
+            if isinstance(value, tuple):
+                self.update_download_task(
+                    task, int(value[0]) if value else 0,
+                    str(value[1]) if len(value) > 1 else "")
+
+        run_task(self, job, on_progress=on_progress, on_done=done,
+                 on_error=failed, name="mod-download")
+
     def install_modrinth_project(self, hit: dict[str, Any], project_type: str,
                                  card: Any = None, page: Any = None,
                                  selected_version: dict[str, Any] | None = None) -> None:
@@ -1044,7 +1629,7 @@ class MainWindow(QMainWindow):
         if project_type != "modpack" and not version:
             self.toast("请先选择一个已安装版本", "warning")
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             return
         if project_type == "mod" and version and not version.loaders:
             if not ConfirmDialog.ask(
@@ -1052,14 +1637,17 @@ class MainWindow(QMainWindow):
                     "这个版本是原版，没有安装 Fabric / Forge / NeoForge。"
                     "放入模组后游戏可能无法启动。仍要下载吗？", "仍然下载"):
                 if card:
-                    card.set_installing(False)
+                    self._set_card_busy(card, False)
                 return
+        if project_type == "shader" and version and not self._instance_has_iris(version):
+            self.toast("当前版本没有安装 Iris Shader，光影可能无法生效；文件仍会下载。",
+                       "warning", 8000)
         base_version = version.base_version if version else self.latest_release
         loader = ""
         if project_type == "mod" and version and version.loaders:
             loader = version.primary_loader
         if card:
-            card.set_installing(True, "查询版本…")
+            self._set_card_busy(card, True, "查询版本…")
         if project_type == "modpack":
             self._install_modpack_project(
                 hit, base_version, card, selected_version=selected_version)
@@ -1072,6 +1660,9 @@ class MainWindow(QMainWindow):
             directory = self.minecraft.mods_dir(version, create=True)
         game_version = base_version
         destination_dir = directory
+        if project_type == "mod" and selected_version is None and version is not None:
+            self._begin_mod_plan(hit, version, card, "modrinth")
+            return
 
         def job(progress, cancel):
             progress((6, "查询兼容文件…"))
@@ -1089,6 +1680,10 @@ class MainWindow(QMainWindow):
             file = self.modrinth.primary_file(chosen)
             if not file:
                 raise LauncherError("这个项目版本没有可下载文件。")
+            if project_type == "mod":
+                self._install_modrinth_dependencies(
+                    chosen, directory, game_version, loader, progress, cancel,
+                    {str(hit.get("project_id") or hit.get("slug") or "")})
             filename = Path(str(file.get("filename") or "download.bin")).name
             target = destination_dir / filename
             progress((22, f"下载 {filename}…"))
@@ -1098,9 +1693,12 @@ class MainWindow(QMainWindow):
                 progress((pct, f"下载 {filename} · {format_size(done)} / {format_size(total)}"))
 
             from ..utils import download_file
+            sha1 = str((file.get("hashes") or {}).get("sha1") or "")
+            if not sha1:
+                raise LauncherError(f"{filename} 缺少 SHA-1，已拒绝下载。")
             download_file(
                 self.modrinth.file_urls(file), target,
-                sha1=(file.get("hashes") or {}).get("sha1"),
+                sha1=sha1,
                 size=file.get("size") or None, progress=dl, cancel=cancel,
                 context=filename,
             )
@@ -1114,7 +1712,7 @@ class MainWindow(QMainWindow):
             title = str(hit.get("title") or "内容")
             self.toast(f"{title} 已放入{'模组' if project_type == 'mod' else '资源目录'}", "success")
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             if project_type == "mod":
                 self.content_page.refresh()
             else:
@@ -1123,7 +1721,7 @@ class MainWindow(QMainWindow):
 
         def fail(message: str) -> None:
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             self.toast(message, "error", 6000)
 
         run_task(self, job, on_done=finish, on_error=fail, name="modrinth-install")
@@ -1135,18 +1733,18 @@ class MainWindow(QMainWindow):
             self.toast("CurseForge 整合包请先打开项目页下载；当前自动安装支持模组/资源包/光影。",
                        "warning", 6000)
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             return
         version = self.current_version()
         if not version:
             self.toast("请先选择一个已安装版本", "warning")
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             return
         if not self.curseforge.enabled:
             self.toast("CurseForge 需要 API Key：设置 → 下载与网络 中填写。", "warning", 7000)
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             return
         if project_type == "mod" and not version.loaders:
             if not ConfirmDialog.ask(
@@ -1154,8 +1752,11 @@ class MainWindow(QMainWindow):
                     "这个版本是原版，没有安装 Fabric / Forge / NeoForge。放入模组后游戏可能无法启动。仍要下载吗？",
                     "仍然下载"):
                 if card:
-                    card.set_installing(False)
+                    self._set_card_busy(card, False)
                 return
+        if project_type == "shader" and not self._instance_has_iris(version):
+            self.toast("当前版本没有安装 Iris Shader，光影可能无法生效；文件仍会下载。",
+                       "warning", 8000)
         if project_type == "resourcepack":
             directory = self.minecraft.resourcepacks_dir(version, create=True)
         elif project_type == "shader":
@@ -1164,7 +1765,10 @@ class MainWindow(QMainWindow):
             directory = self.minecraft.mods_dir(version, create=True)
         loader = version.primary_loader if project_type == "mod" and version.loaders else ""
         if card:
-            card.set_installing(True, "查询版本…")
+            self._set_card_busy(card, True, "查询版本…")
+        if project_type == "mod" and selected_file is None:
+            self._begin_mod_plan(hit, version, card, "curseforge")
+            return
 
         def job(progress, cancel):
             progress((6, "查询 CurseForge 文件…"))
@@ -1182,6 +1786,10 @@ class MainWindow(QMainWindow):
                     f"{CurseForgeService.project_type_label(project_type)}文件。")
             filename = Path(str(chosen.get("fileName") or "download.bin")).name
             target = directory / filename
+            if project_type == "mod":
+                self._install_curseforge_dependencies(
+                    chosen, directory, version.base_version, loader, progress, cancel,
+                    {str(hit.get("project_id") or "")})
             progress((22, f"下载 {filename}…"))
 
             def dl(done, total):
@@ -1197,20 +1805,129 @@ class MainWindow(QMainWindow):
             self.toast(f"{title} 已放入“模组”" if project_type == "mod"
                        else f"{title} 已放入资源目录", "success")
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             self.content_page.refresh()
             self.refresh_home_stats()
 
         def fail(message: str) -> None:
             if card:
-                card.set_installing(False)
+                self._set_card_busy(card, False)
             self.toast(message, "error", 7000)
 
         run_task(self, job, on_done=finish, on_error=fail, name="curseforge-install")
 
+    def _instance_has_iris(self, version: InstalledVersion) -> bool:
+        try:
+            mods = self.minecraft.mods_dir(version)
+        except OSError:
+            return False
+        if not mods.exists():
+            return False
+        return any("iris" in path.name.lower() or "oculus" in path.name.lower()
+                   for path in mods.glob("*.jar"))
+
+    def download_content_project(self, hit: dict[str, Any], project_type: str,
+                                 selected: dict[str, Any] | None, *,
+                                 instance: InstalledVersion | None = None,
+                                 parent: Any = None) -> None:
+        """Download a user-selected file without auto-picking or installing it."""
+        if project_type == "modpack":
+            self.toast("整合包请使用版本列表中的安装操作。", "warning")
+            return
+        if not isinstance(selected, dict):
+            self.toast("没有选择具体文件版本。", "warning")
+            return
+        source = str(hit.get("source") or "modrinth")
+        if source == "curseforge":
+            if not self.curseforge.enabled:
+                self.toast("CurseForge 需要 API Key：设置 → 下载与网络。", "warning", 7000)
+                return
+            chosen = selected
+            filename = Path(str(chosen.get("fileName") or "download.bin")).name
+            sha1 = self.curseforge.sha1(chosen)
+            if not sha1:
+                self.toast("CurseForge 文件缺少 SHA-1，已拒绝下载。", "error")
+                return
+            urls = self.curseforge.file_urls(chosen)
+        else:
+            chosen = selected
+            file = self.modrinth.primary_file(chosen)
+            if not file:
+                self.toast("这个版本没有可下载文件。", "warning")
+                return
+            filename = Path(str(file.get("filename") or "download.bin")).name
+            sha1 = str((file.get("hashes") or {}).get("sha1") or "")
+            if not sha1:
+                self.toast("文件缺少 SHA-1，已拒绝下载。", "error")
+                return
+            urls = self.modrinth.file_urls(file)
+        if not urls:
+            self.toast("没有可用的下载地址。", "warning")
+            return
+        if project_type == "shader" and instance is not None and not self._instance_has_iris(instance):
+            self.toast("当前版本没有安装 Iris Shader，光影可能无法生效；文件仍会下载。",
+                       "warning", 8000)
+        if instance is not None:
+            if project_type == "resourcepack":
+                destination = self.minecraft.resourcepacks_dir(instance, create=True)
+            elif project_type == "shader":
+                destination = self.minecraft.shaderpacks_dir(instance, create=True)
+            else:
+                destination = self.minecraft.mods_dir(instance, create=True)
+        else:
+            destination = executable_dir() / "Download"
+        target = destination / filename
+
+        def job(progress, cancel):
+            destination.mkdir(parents=True, exist_ok=True)
+            progress((12, f"下载 {filename}…"))
+
+            def dl(done, total):
+                pct = 12 + int(done / max(1, total) * 80)
+                progress((pct, f"下载 {filename} · {format_size(done)} / {format_size(total)}"))
+
+            from ..utils import download_file
+            download_file(
+                urls, target, sha1=sha1, size=(
+                    int(chosen.get("fileLength") or 0) or None
+                    if source == "curseforge"
+                    else int((file.get("size") or 0)) or None),
+                progress=dl, cancel=cancel, context=filename,
+            )
+            if (project_type == "mod" and instance is not None
+                    and source != "curseforge"):
+                record_source(instance, target.name, hit, chosen, file)
+            return target
+
+        def finish(result: object) -> None:
+            path = result if isinstance(result, Path) else target
+            self.toast(f"已下载到 {path.parent}", "success", 5000)
+            if instance is not None:
+                self.content_page.refresh()
+
+        def fail(message: str) -> None:
+            self.toast(message, "error", 7000)
+
+        run_task(self, job, on_done=finish, on_error=fail, name="content-download")
+
+    def _ask_modpack_name(self, default: str) -> str | None:
+        name, ok = QInputDialog.getText(
+            self, "整合包版本名称",
+            "给这个整合包版本起个名字（可中文，留空使用默认）：",
+            text=default)
+        if not ok:
+            return None
+        return name.strip() or default
+
     def _install_modpack_project(self, hit: dict[str, Any], base_version: str,
                                  card: Any = None,
                                  selected_version: dict[str, Any] | None = None) -> None:
+        default_name = str(hit.get("title") or "整合包")
+        pack_name = self._ask_modpack_name(default_name)
+        if pack_name is None:
+            if card:
+                self._set_card_busy(card, False)
+            return
         java = self.java_for_install(base_version)
         java_path = str(java.path) if java else ""
         project_id = str(hit.get("project_id") or hit.get("slug") or "")
@@ -1236,9 +1953,12 @@ class MainWindow(QMainWindow):
                           f"下载整合包 · {format_size(done)} / {format_size(total)}"))
 
             from ..utils import download_file
+            sha1 = str((file.get("hashes") or {}).get("sha1") or "")
+            if not sha1:
+                raise LauncherError("整合包文件缺少 SHA-1，已拒绝下载。")
             download_file(
                 self.modrinth.file_urls(file), target_path,
-                sha1=(file.get("hashes") or {}).get("sha1"),
+                sha1=sha1,
                 size=file.get("size") or None, progress=dl, cancel=cancel,
                 context="整合包",
             )
@@ -1252,7 +1972,7 @@ class MainWindow(QMainWindow):
 
             return self.modpack.import_modpack(
                 target_path, java_path=java_path, progress=pack_progress,
-                log=pack_log, cancel=cancel,
+                log=pack_log, cancel=cancel, name=pack_name,
             )
 
         dialog = ProgressJobDialog(
@@ -1261,10 +1981,12 @@ class MainWindow(QMainWindow):
             job, success_text="整合包已停靠进版本。", width=720, height=540, parent=self)
         accepted = dialog.run()
         if card:
-            card.set_installing(False)
+            self._set_card_busy(card, False)
         if accepted == QDialog.DialogCode.Accepted:
             installed = dialog.result_object
             installed_id = getattr(installed, "id", "")
+            if isinstance(installed, InstalledVersion):
+                self._apply_new_version_language(installed)
             self.refresh_all_versions(select=installed_id or None)
             self.toast("整合包导入完成", "success")
         else:
@@ -1296,6 +2018,9 @@ class MainWindow(QMainWindow):
             pass
         java = self.java_for_install(base_version)
         java_path = str(java.path) if java else ""
+        pack_name = self._ask_modpack_name(pack_title)
+        if pack_name is None:
+            return
 
         def job(progress, cancel):
             state = {"percent": 2}
@@ -1305,7 +2030,8 @@ class MainWindow(QMainWindow):
             def log(message):
                 progress((state["percent"], message))
             return self.modpack.import_modpack(
-                path, java_path=java_path, progress=report, log=log, cancel=cancel)
+                path, java_path=java_path, progress=report, log=log, cancel=cancel,
+                name=pack_name)
 
         dialog = ProgressJobDialog(
             self.theme, "导入整合包", f"{pack_title} · 目标 Minecraft {base_version}",
@@ -1314,8 +2040,14 @@ class MainWindow(QMainWindow):
         if dialog.run() == QDialog.DialogCode.Accepted:
             installed = dialog.result_object
             installed_id = getattr(installed, "id", "")
+            if isinstance(installed, InstalledVersion):
+                self._apply_new_version_language(installed)
             self.refresh_all_versions(select=installed_id or None)
-            self.toast("整合包导入完成", "success")
+            warning = getattr(self.modpack, "last_import_warning", "")
+            if warning:
+                self.toast(warning, "warning", 12000)
+            else:
+                self.toast("整合包导入完成", "success")
         else:
             self.toast("整合包导入没有完成", "info")
 
@@ -1378,7 +2110,7 @@ class MainWindow(QMainWindow):
         self.shell_root.set_theme(self.theme)
         self.titlebar.update_theme(self.theme)
         for page in (self.home_page, self.download_page, self.versions_page,
-                     self.content_page, self.settings_page):
+                     self.content_page, self.tasks_page, self.settings_page):
             try:
                 page.theme = self.theme
                 page.set_theme(self.theme)
@@ -1438,6 +2170,10 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "download_page"):
                     self.download_page.game_tab.latest_id.setText(self.latest_release or "未知版本")
                 self._update_footer()
+                notice = getattr(self.mojang, "last_fallback_notice", "")
+                if notice:
+                    self.toast(notice, "warning", 7000)
+                    self.mojang.last_fallback_notice = ""
 
         def fail(message: str) -> None:
             self._manifest_loading = False

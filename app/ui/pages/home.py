@@ -63,8 +63,8 @@ class HomePage(ScrollPage):
         self.account_type_pill.set_theme(self.theme)
         account_row.addWidget(self.account_type_pill)
         account_row.addStretch()
-        self.buy_button = make_button("购买 Minecraft 正版", "ghost", "globe", "accent", 13)
-        self.buy_button.setToolTip("打开 Minecraft 官方购买页面")
+        self.buy_button = make_button("购买 Minecraft 正版", "ghost", "external", "accent", 13)
+        self.buy_button.setToolTip("打开微软商店购买页面")
         self.buy_button.clicked.connect(self._open_purchase)
         account_row.addWidget(self.buy_button)
         manage = make_button("管理玩家", "secondary", "user", "muted", 14)
@@ -160,7 +160,12 @@ class HomePage(ScrollPage):
 
     # ------------------------------------------------------------------ state
     def _open_purchase(self) -> None:
-        QDesktopServices.openUrl(QUrl("https://www.minecraft.net/zh-hans/choose-your-game"))
+        store = QUrl("ms-windows-store://pdp/?ProductId=9NXP44L49SHJ")
+        if QDesktopServices.openUrl(store):
+            return
+        QDesktopServices.openUrl(QUrl(
+            "https://apps.microsoft.com/detail/9NXP44L49SHJ"
+            "?hl=zh-hans&gl=CN&ocid=pdpshare"))
 
     def refresh_versions(self) -> None:
         versions = list(getattr(self.shell, "versions", []))

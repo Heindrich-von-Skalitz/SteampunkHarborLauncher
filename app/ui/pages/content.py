@@ -8,8 +8,8 @@ from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ...core.minecraft import InstalledVersion
@@ -28,6 +28,7 @@ from ..widgets import (
 class ModRow(QFrame):
     toggled = pyqtSignal(object, bool)
     delete_requested = pyqtSignal(object)
+    selection_changed = pyqtSignal(object, bool)
 
     def __init__(self, mod: ModInfo, theme: Theme, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -38,6 +39,11 @@ class ModRow(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(13, 9, 12, 9)
         layout.setSpacing(11)
+        self.check = QCheckBox()
+        self.check.setToolTip("选择这个模组进行批量操作")
+        self.check.hide()
+        self.check.toggled.connect(lambda checked: self.selection_changed.emit(mod, checked))
+        layout.addWidget(self.check)
         icon = ProjectIcon(40)
         icon.set_fallback(mod.name)
         icon.set_theme(theme)
@@ -81,14 +87,23 @@ class ModRow(QFrame):
         self.switch.setToolTip("启用 / 停用这个模组")
         self.switch.toggled.connect(lambda checked: self.toggled.emit(mod, checked))
         layout.addWidget(self.switch)
-        delete = icon_button("trash", "移除此模组", icon_role="danger", size=14)
-        delete.clicked.connect(lambda: self.delete_requested.emit(mod))
-        layout.addWidget(delete)
+        self.delete_button = icon_button("trash", "移除此模组", icon_role="danger", size=14)
+        self.delete_button.clicked.connect(lambda: self.delete_requested.emit(mod))
+        layout.addWidget(self.delete_button)
+
+    def set_batch_mode(self, enabled: bool, selected: bool = False) -> None:
+        self.check.blockSignals(True)
+        self.check.setVisible(enabled)
+        self.check.setChecked(bool(enabled and selected))
+        self.check.blockSignals(False)
+        self.switch.setEnabled(not enabled)
+        self.delete_button.setEnabled(not enabled)
 
 
 class ResourceRow(QFrame):
     delete_requested = pyqtSignal(object)
     open_requested = pyqtSignal(object)
+    toggled = pyqtSignal(object, bool)
 
     def __init__(self, resource: ResourceInfo, theme: Theme, kind: str,
                  parent: QWidget | None = None) -> None:
@@ -118,6 +133,11 @@ class ResourceRow(QFrame):
         size = QLabel(format_size(resource.size))
         size.setStyleSheet(f"color: {theme.text_faint}; font-size: 10px;")
         layout.addWidget(size)
+        if kind == "resourcepacks":
+            self.switch = ToggleSwitch(resource.enabled)
+            self.switch.setToolTip("勾选后进入游戏自动加载这个材质包")
+            self.switch.toggled.connect(lambda checked: self.toggled.emit(resource, checked))
+            layout.addWidget(self.switch)
         open_button = icon_button("folder", "打开所在目录", icon_role="muted", size=14)
         open_button.clicked.connect(lambda: self.open_requested.emit(resource))
         layout.addWidget(open_button)
@@ -248,6 +268,8 @@ class ContentPage(QWidget):
         self.search_text = ""
         self.mods: list[ModInfo] = []
         self.issues: list[str] = []
+        self._batch_mode = False
+        self._selected_mods: set[str] = set()
         self.setAcceptDrops(True)
         self._build()
         self.refresh()
@@ -311,6 +333,9 @@ class ContentPage(QWidget):
         self.add_mod_button = make_button("添加文件", "secondary", "plus", "muted", 14)
         self.add_mod_button.clicked.connect(self._add_for_tab)
         controls.addWidget(self.add_mod_button)
+        self.batch_button = make_button("批量管理", "secondary", "list", "muted", 14)
+        self.batch_button.clicked.connect(self._toggle_batch_mode)
+        controls.addWidget(self.batch_button)
         outer.addLayout(controls)
 
         self.stack = QStackedWidget()
@@ -339,6 +364,33 @@ class ContentPage(QWidget):
         self.issues_banner = InfoBanner("", "warning", "alert")
         self.issues_banner.hide()
         layout.addWidget(self.issues_banner)
+        self.batch_bar = QFrame()
+        self.batch_bar.setObjectName("SubCard")
+        batch_layout = QHBoxLayout(self.batch_bar)
+        batch_layout.setContentsMargins(12, 7, 12, 7)
+        batch_layout.setSpacing(8)
+        self.batch_label = QLabel("已选择 0 个模组")
+        self.batch_label.setStyleSheet(
+            f"color: {self.theme.text_muted}; font-size: 11px;")
+        batch_layout.addWidget(self.batch_label)
+        batch_layout.addStretch()
+        self.batch_all_button = make_button("全选", "secondary", "check", "muted", 13)
+        self.batch_all_button.clicked.connect(self._batch_select_all)
+        batch_layout.addWidget(self.batch_all_button)
+        self.batch_enable_button = make_button("启用", "secondary", "check_circle", "muted", 13)
+        self.batch_enable_button.clicked.connect(lambda: self._batch_set_enabled(True))
+        batch_layout.addWidget(self.batch_enable_button)
+        self.batch_disable_button = make_button("停用", "secondary", "minus", "muted", 13)
+        self.batch_disable_button.clicked.connect(lambda: self._batch_set_enabled(False))
+        batch_layout.addWidget(self.batch_disable_button)
+        self.batch_delete_button = make_button("删除", "secondary", "trash", "danger", 13)
+        self.batch_delete_button.clicked.connect(self._batch_delete)
+        batch_layout.addWidget(self.batch_delete_button)
+        self.batch_close_button = make_button("退出批量", "secondary", "close", "muted", 13)
+        self.batch_close_button.clicked.connect(self._toggle_batch_mode)
+        batch_layout.addWidget(self.batch_close_button)
+        self.batch_bar.hide()
+        layout.addWidget(self.batch_bar)
         self.mods_scroll = QScrollArea()
         self.mods_scroll.setWidgetResizable(True)
         self.mods_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -472,11 +524,19 @@ class ContentPage(QWidget):
         query = self.search_text.lower()
         shown = [m for m in self.mods
                  if not query or query in (m.name + " " + m.filename + " " + m.mod_id).lower()]
+        existing = {str(mod.path) for mod in self.mods}
+        self._selected_mods.intersection_update(existing)
         for mod in shown:
             row = ModRow(mod, self.theme)
             row.toggled.connect(self._toggle_mod)
             row.delete_requested.connect(self._delete_mod)
+            row.selection_changed.connect(self._select_mod)
+            row.set_batch_mode(self._batch_mode, str(mod.path) in self._selected_mods)
             self.mods_layout.insertWidget(self.mods_layout.count() - 1, row)
+        self._update_batch_label()
+        if hasattr(self, "batch_all_button"):
+            self.batch_all_button.setText(
+                "取消全选" if shown and len(self._selected_mods) >= len(shown) else "全选")
         self.mods_empty.setVisible(not shown)
         if not shown:
             self.mods_empty.action_button.setText("重扫内容" if self.search_text and self.mods else "去下载模组")
@@ -504,6 +564,8 @@ class ContentPage(QWidget):
                 row = ResourceRow(resource, self.theme, kind)
                 row.open_requested.connect(self._open_resource)
                 row.delete_requested.connect(lambda r, k=kind: self._delete_resource(r, k))
+                if kind == "resourcepacks":
+                    row.toggled.connect(self._toggle_resourcepack)
                 host_layout.insertWidget(host_layout.count() - 1, row)
             empty.setVisible(not resources)
 
@@ -533,6 +595,12 @@ class ContentPage(QWidget):
     def _switch_tab(self, key: str, force: bool = False) -> None:
         if not force and key == self.active_tab:
             return
+        if key != "mods" and self._batch_mode:
+            self._batch_mode = False
+            self._selected_mods.clear()
+            self.batch_bar.hide()
+            self.batch_button.setText("批量管理")
+            self._update_batch_label()
         self.active_tab = key
         mapping = {"mods": self.mods_page, "resourcepacks": self.resource_page,
                    "shaderpacks": self.shader_page, "saves": self.saves_page}
@@ -574,6 +642,99 @@ class ContentPage(QWidget):
         self.search_text = text.strip()
         self._render_all_after_search()
 
+    def _toggle_batch_mode(self) -> None:
+        self._batch_mode = not self._batch_mode
+        if self._batch_mode:
+            self._switch_tab("mods")
+            self.batch_bar.show()
+            self.batch_button.setText("退出批量")
+            self._render_mods()
+        else:
+            self._selected_mods.clear()
+            self.batch_bar.hide()
+            self.batch_button.setText("批量管理")
+            self._render_mods()
+        self._update_batch_label()
+
+    def _select_mod(self, mod: ModInfo, checked: bool) -> None:
+        key = str(mod.path)
+        if checked:
+            self._selected_mods.add(key)
+        else:
+            self._selected_mods.discard(key)
+        self._update_batch_label()
+
+    def _update_batch_label(self) -> None:
+        if hasattr(self, "batch_label"):
+            self.batch_label.setText(f"已选择 {len(self._selected_mods)} 个模组")
+
+    def _batch_selected(self) -> list[ModInfo]:
+        return [mod for mod in self.mods if str(mod.path) in self._selected_mods]
+
+    def _batch_select_all(self) -> None:
+        shown = [mod for mod in self.mods
+                 if not self.search_text or self.search_text in
+                 (mod.name + " " + mod.filename + " " + mod.mod_id).lower()]
+        if len(self._selected_mods) >= len(shown) and shown:
+            self._selected_mods.clear()
+            self.batch_all_button.setText("全选")
+        else:
+            self._selected_mods = {str(mod.path) for mod in shown}
+            self.batch_all_button.setText("取消全选")
+        self._render_mods()
+        self._update_batch_label()
+
+    def _batch_set_enabled(self, enabled: bool) -> None:
+        selected = self._batch_selected()
+        if not selected:
+            self.shell.toast("请先勾选要批量操作的模组", "warning")
+            return
+        changed = 0
+        errors: list[str] = []
+        for mod in selected:
+            if mod.enabled == enabled:
+                continue
+            try:
+                self.shell.mod_manager.toggle(mod)
+                changed += 1
+            except (LauncherError, OSError) as exc:
+                errors.append(str(exc))
+        self._selected_mods.clear()
+        self.refresh()
+        self.shell.refresh_content_counts()
+        self._update_batch_label()
+        if errors:
+            self.shell.toast(errors[0], "error")
+        else:
+            self.shell.toast(f"已{'启用' if enabled else '停用'} {changed} 个模组", "success")
+
+    def _batch_delete(self) -> None:
+        selected = self._batch_selected()
+        if not selected:
+            self.shell.toast("请先勾选要删除的模组", "warning")
+            return
+        if not ConfirmDialog.ask(
+                self, self.theme, "批量移除模组",
+                f"要把选中的 {len(selected)} 个模组移到启动器回收站吗？",
+                "全部移除", danger=True):
+            return
+        removed = 0
+        errors: list[str] = []
+        for mod in selected:
+            try:
+                self.shell.mod_manager.delete(mod)
+                removed += 1
+            except (LauncherError, OSError) as exc:
+                errors.append(str(exc))
+        self._selected_mods.clear()
+        self.refresh()
+        self.shell.refresh_content_counts()
+        self._update_batch_label()
+        if errors:
+            self.shell.toast(errors[0], "error")
+        else:
+            self.shell.toast(f"已移除 {removed} 个模组", "success")
+
     def _toggle_mod(self, mod: ModInfo, checked: bool) -> None:
         try:
             self.shell.mod_manager.toggle(mod)
@@ -582,6 +743,19 @@ class ContentPage(QWidget):
             self.shell.toast(str(exc), "error")
         self.refresh()
         self.shell.refresh_content_counts()
+
+    def _toggle_resourcepack(self, resource: Any, checked: bool) -> None:
+        version = self.shell.current_version()
+        if not version:
+            self.shell.toast("请先选择一个版本", "warning")
+            return
+        try:
+            self.shell.mod_manager.set_resourcepack_enabled(version, resource, checked)
+            self.shell.toast(
+                f"已{'加载' if checked else '取消加载'}材质包 {resource.name}", "success")
+        except (LauncherError, OSError) as exc:
+            self.shell.toast(str(exc), "error")
+        self.refresh()
 
     def _delete_mod(self, mod: ModInfo) -> None:
         if not ConfirmDialog.ask(

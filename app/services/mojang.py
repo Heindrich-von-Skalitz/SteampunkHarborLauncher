@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,10 +13,136 @@ from ..constants import (
     OFFICIAL_MANIFEST, QUILT_META, QUILT_META_MIRROR,
 )
 from ..paths import cache_dir
-from ..utils import NetworkError, LauncherError, read_json, request_json, write_json
+from ..utils import (
+    LauncherError, NetworkError, is_allowed_download_host, read_json, request_json,
+    safe_component, write_json,
+)
 
 LOG = logging.getLogger("shl.mojang")
 MANIFEST_TTL = 60 * 60 * 6
+HASH_RE = re.compile(r"^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$")
+LIBRARY_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$")
+
+
+def _valid_metadata_url(value: Any) -> bool:
+    try:
+        parsed = urlparse(str(value or ""))
+        port = parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and bool(parsed.hostname)
+            and not parsed.username and not parsed.password
+            and port in {None, 443}
+            and is_allowed_download_host(parsed.hostname.lower().rstrip(".")))
+
+
+def _valid_library_path(value: Any) -> bool:
+    text = str(value or "").replace("\\", "/").lstrip("/")
+    if not LIBRARY_PATH_RE.fullmatch(text):
+        return False
+    return all(part not in {".", ".."} for part in text.split("/"))
+
+
+def _hash_ok(value: Any) -> bool:
+    return bool(HASH_RE.fullmatch(str(value or "")))
+
+
+def validate_mirror_metadata(data: dict[str, Any], version_id: str) -> None:
+    """方案三: strict structural validation for metadata without official hashes."""
+    if not isinstance(data, dict) or str(data.get("id") or "") != str(version_id):
+        raise LauncherError("镜像元数据版本 ID 不正确。")
+    client = ((data.get("downloads") or {}).get("client") or {})
+    if not _valid_metadata_url(client.get("url")) or not _hash_ok(client.get("sha1")):
+        raise LauncherError("镜像元数据的客户端下载地址或哈希非法。")
+    index = data.get("assetIndex") or {}
+    if index:
+        if not _valid_metadata_url(index.get("url")) or not _hash_ok(index.get("sha1")):
+            raise LauncherError("镜像元数据的资源索引地址或哈希非法。")
+        safe_component(str(index.get("id") or ""), "资源索引 ID")
+    logging = ((data.get("logging") or {}).get("client") or {})
+    log_file = logging.get("file") or {}
+    if log_file:
+        if not _valid_metadata_url(log_file.get("url")) or not _hash_ok(log_file.get("sha1")):
+            raise LauncherError("镜像元数据的日志配置地址或哈希非法。")
+        safe_component(str(log_file.get("id") or ""), "日志配置 ID")
+    for lib in data.get("libraries") or []:
+        if not isinstance(lib, dict):
+            continue
+        downloads = lib.get("downloads") or {}
+        entries = [downloads.get("artifact") or {}]
+        entries.extend((downloads.get("classifiers") or {}).values())
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry:
+                continue
+            path = entry.get("path")
+            if path and not _valid_library_path(path):
+                raise LauncherError(f"镜像元数据包含非法库路径：{path!r}")
+            if entry.get("url") and not _valid_metadata_url(entry.get("url")):
+                raise LauncherError(f"镜像元数据包含非法库地址：{entry.get('url')!r}")
+            if entry.get("sha1") and not _hash_ok(entry.get("sha1")):
+                raise LauncherError(f"镜像元数据包含非法库哈希：{entry.get('sha1')!r}")
+
+
+def validate_loader_profile(data: dict[str, Any], label: str) -> None:
+    """Validate Fabric/Quilt profile structure and download URLs."""
+    if not isinstance(data, dict) or not data.get("id"):
+        raise LauncherError(f"{label} 安装配置格式不正确。")
+    libraries = data.get("libraries")
+    if not isinstance(libraries, list) or not libraries:
+        raise LauncherError(f"{label} 安装配置没有库列表。")
+    for library in libraries:
+        if not isinstance(library, dict) or not library.get("name"):
+            raise LauncherError(f"{label} 安装配置包含非法库条目。")
+        url = library.get("url")
+        if url and not _valid_metadata_url(url):
+            raise LauncherError(f"{label} 安装配置包含非法库地址：{url!r}")
+        sha1 = library.get("sha1")
+        if sha1 and not _hash_ok(sha1):
+            raise LauncherError(f"{label} 安装配置包含非法库哈希：{sha1!r}")
+
+
+def _maven_path(name: str) -> str:
+    raw = str(name or "").split("@", 1)[0]
+    parts = raw.split(":")
+    if len(parts) < 3:
+        return ""
+    group, artifact, version = parts[0], parts[1], parts[2]
+    classifier = f"-{parts[3]}" if len(parts) >= 4 else ""
+    return (group.replace(".", "/") + "/" + artifact + "/" + version + "/"
+            + artifact + "-" + version + classifier + ".jar")
+
+
+def _ensure_loader_hashes(data: dict[str, Any], label: str) -> None:
+    """Fill missing Fabric/Quilt artifact hashes from their Maven .sha1 files."""
+    for library in data.get("libraries") or []:
+        if not isinstance(library, dict) or library.get("sha1"):
+            continue
+        base = str(library.get("url") or "").rstrip("/")
+        path = _maven_path(str(library.get("name") or ""))
+        if not base or not path:
+            continue
+        try:
+            text = request_text(f"{base}/{path}.sha1", timeout=20,
+                                context=f"获取 {label} 库哈希")
+            match = re.search(r"\b[0-9a-fA-F]{40}\b", text)
+            if not match:
+                raise LauncherError(f"{label} 库缺少 SHA-1：{library.get('name')}")
+            library["sha1"] = match.group(0).lower()
+        except Exception as exc:
+            raise LauncherError(f"无法校验 {label} 库 {library.get('name')}：{exc}") from exc
+
+
+def validate_manifest(data: dict[str, Any]) -> None:
+    versions = data.get("versions") if isinstance(data, dict) else None
+    if not isinstance(versions, list) or not versions:
+        raise LauncherError("镜像版本清单格式不正确。")
+    for item in versions:
+        if not isinstance(item, dict):
+            raise LauncherError("镜像版本清单包含非法条目。")
+        safe_component(str(item.get("id") or ""), "版本 ID")
+        if not _valid_metadata_url(item.get("url")):
+            raise LauncherError(f"镜像版本清单包含非法地址：{item.get('url')!r}")
+
 
 
 def _cache_versions_dir() -> Path:
@@ -30,17 +157,24 @@ class MojangService:
         self._manifest: dict[str, Any] | None = None
         self._manifest_mtime = 0.0
         self._manifest_cache = cache_dir() / "version_manifest_v2.json"
+        self._official_manifest: dict[str, Any] | None = None
+        self._official_manifest_mtime = 0.0
+        self.last_fallback_notice = ""
 
     @property
     def source(self) -> str:
-        return str(self.settings.get("download_source") or "auto")
+        value = str(self.settings.get("download_source") or "auto")
+        return "mirror_priority" if value == "mirror" else value
 
     def _manifest_urls(self) -> list[str]:
-        source = self.source
-        if source == "official":
-            return [OFFICIAL_MANIFEST]
-        if source == "mirror":
+        # "mirror_only" never falls back to official. "mirror" prefers BMCLAPI
+        # but can use official. "auto" prefers official and falls back to BMCL.
+        if self.source == "mirror_only":
             return [MIRROR_MANIFEST]
+        if self.source == "mirror_priority":
+            return [MIRROR_MANIFEST, OFFICIAL_MANIFEST]
+        if self.source == "official":
+            return [OFFICIAL_MANIFEST]
         return [OFFICIAL_MANIFEST, MIRROR_MANIFEST]
 
     def get_manifest(self, *, force: bool = False) -> dict[str, Any]:
@@ -49,6 +183,11 @@ class MojangService:
             if age < 300:
                 return self._manifest
         cached = read_json(self._manifest_cache, None)
+        cached_sources = {"Mojang", "本地缓存"}
+        if self.source != "official":
+            cached_sources.add("BMCLAPI")
+        if isinstance(cached, dict) and cached.get("_source") not in cached_sources:
+            cached = None
         if isinstance(cached, dict) and not force:
             try:
                 age = time.time() - self._manifest_cache.stat().st_mtime
@@ -66,6 +205,11 @@ class MojangService:
                 data = request_json(url, timeout=30, context="获取 Minecraft 版本清单",
                                     headers={"Accept": "application/json"})
                 if isinstance(data, dict) and isinstance(data.get("versions"), list):
+                    if "bmclapi" in url:
+                        validate_manifest(data)
+                        if self.source in {"auto", "official_priority"}:
+                            self.last_fallback_notice = (
+                                "官方元数据连接失败，已自动切换至第三方镜像获取版本信息。")
                     self._manifest = data
                     self._manifest_mtime = time.time()
                     data["_source"] = "BMCLAPI" if "bmclapi" in url else "Mojang"
@@ -108,32 +252,130 @@ class MojangService:
             pass
         return None
 
+    def _official_version_url(self, version_id: str) -> str:
+        """Resolve a version URL from an official manifest anchor.
+
+        Never use the current (possibly BMCLAPI-backed) manifest here: that was
+        the F-01 deadlock where a mirror URL was used to "verify" the mirror.
+        """
+        now = time.time()
+        manifest = self._official_manifest
+        if manifest is not None and now - self._official_manifest_mtime < 300:
+            entries = manifest.get("versions") if isinstance(manifest, dict) else None
+        elif isinstance(self._manifest, dict) and self._manifest.get("_source") == "Mojang":
+            entries = self._manifest.get("versions")
+            manifest = self._manifest
+        else:
+            try:
+                data = request_json(OFFICIAL_MANIFEST, timeout=30,
+                                    context="获取官方版本清单锚点",
+                                    headers={"Accept": "application/json"})
+                if isinstance(data, dict) and isinstance(data.get("versions"), list):
+                    self._official_manifest = data
+                    self._official_manifest_mtime = now
+                    manifest = data
+                    entries = data.get("versions")
+                else:
+                    entries = None
+            except Exception as exc:
+                LOG.warning("Official manifest anchor failed: %s", exc)
+                entries = None
+        for item in entries or []:
+            if isinstance(item, dict) and str(item.get("id") or "") == version_id:
+                url = str(item.get("url") or "")
+                return url if _valid_metadata_url(url) else ""
+        return ""
+
     def metadata(self, version_id: str, *, force: bool = False) -> dict[str, Any]:
         cached_path = _cache_versions_dir() / f"{version_id}.json"
+        source_path = cached_path.with_suffix(".source")
         cached = read_json(cached_path, None)
-        if isinstance(cached, dict) and not force:
+        allow_mirror = self.source != "official"
+        cached_sources = {"Mojang"}
+        if allow_mirror:
+            cached_sources.add("BMCLAPI")
+        cached_sidecar = ""
+        try:
+            cached_sidecar = source_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        trusted_cache = cached_sidecar in cached_sources
+        if isinstance(cached, dict) and trusted_cache and not force:
             return cached
-        entry = self.version_entry(version_id)
-        official_url = str((entry or {}).get("url") or "")
-        candidates: list[str] = []
-        if official_url:
-            candidates.append(official_url)
-        if self.source != "official":
-            candidates.append(f"https://bmclapi2.bangbang93.com/version/{version_id}/json")
-        if not candidates:
-            candidates = [f"https://bmclapi2.bangbang93.com/version/{version_id}/json"]
+        mirror_url = f"https://bmclapi2.bangbang93.com/version/{version_id}/json"
         errors: list[str] = []
-        for url in candidates:
+
+        def store(data: dict[str, Any], label: str) -> dict[str, Any]:
+            write_json(cached_path, data)
             try:
-                data = request_json(url, timeout=40, context=f"获取 {version_id} 元数据",
+                source_path.write_text(label, encoding="utf-8")
+            except OSError:
+                pass
+            return data
+
+        def fetch(url: str) -> dict[str, Any] | None:
+            try:
+                data = request_json(url, timeout=40,
+                                    context=f"获取 {version_id} 元数据",
                                     headers={"Accept": "application/json"})
                 if isinstance(data, dict) and data.get("id"):
-                    write_json(cached_path, data)
                     return data
             except Exception as exc:
                 errors.append(str(exc))
                 LOG.warning("Version metadata failed (%s): %s", url, exc)
-        # Fall back to an already installed JSON.
+            return None
+
+        def official_attempt() -> dict[str, Any] | None:
+            official_url = self._official_version_url(version_id)
+            if not official_url:
+                return None
+            official = fetch(official_url)
+            if official is None:
+                return None
+            host = (urlparse(official_url).hostname or "").lower()
+            label = "BMCLAPI" if "bmclapi" in host or "sakura" in host else "Mojang"
+            return store(official, label)
+
+        def mirror_attempt() -> dict[str, Any] | None:
+            mirror = fetch(mirror_url)
+            if mirror is None:
+                return None
+            try:
+                validate_mirror_metadata(mirror, version_id)
+            except LauncherError as exc:
+                LOG.warning("BMCLAPI metadata rejected: %s", exc)
+                return None
+            return store(mirror, "BMCLAPI")
+
+        if self.source == "mirror_only":
+            mirror = mirror_attempt()
+            if mirror is not None:
+                LOG.warning("BMCLAPI metadata used in mirror-only mode (third-party trust)")
+                return mirror
+        elif self.source == "mirror_priority":
+            mirror = mirror_attempt()
+            if mirror is not None:
+                return mirror
+            official = official_attempt()
+            if official is not None:
+                return official
+        else:
+            official = official_attempt()
+            if official is not None:
+                return official
+            if self.source == "official":
+                raise NetworkError(
+                    f"仅官方源模式无法从 Mojang 获取 Minecraft {version_id} 的安装信息。" +
+                    (f"（{errors[-1][:160]}）" if errors else ""))
+            mirror = mirror_attempt()
+            if mirror is not None:
+                LOG.warning("Official metadata unavailable; BMCLAPI fallback (third-party)")
+                if self.source in {"auto", "official_priority"}:
+                    self.last_fallback_notice = (
+                        "官方元数据连接失败，已自动切换至第三方镜像获取版本信息。")
+                return mirror
+
+        # Fall back to an already installed JSON (local, trusted filesystem).
         root = Path(self.settings.minecraft_dir)
         local = read_json(root / "versions" / version_id / f"{version_id}.json", None)
         if isinstance(local, dict):
@@ -145,7 +387,7 @@ class MojangService:
         meta = meta or self.metadata(version_id)
         official = ((meta.get("downloads") or {}).get("client") or {}).get("url") or ""
         candidates = []
-        if official:
+        if official and self.source != "mirror_only":
             candidates.append(official)
         if self.source != "official":
             candidates.append(f"https://bmclapi2.bangbang93.com/version/{version_id}/client")
@@ -174,12 +416,11 @@ class MojangService:
         if source == "official" or not url:
             return [url]
         mirror = self.mirror_url(url)
+        if source == "mirror_only":
+            return [mirror] if mirror != url else []
         if mirror == url:
             return [url]
-        # "mirror" means mirror-first, not mirror-only: BMCLAPI does not carry
-        # every Mojang object (for example some logging configs), so a 404 must
-        # fall back to the official URL instead of failing the install.
-        if source == "mirror":
+        if source == "mirror_priority":
             return [mirror, url]
         return [url, mirror]
 
@@ -190,22 +431,19 @@ class LoaderService:
 
     @property
     def source(self) -> str:
-        return str(self.settings.get("download_source") or "auto")
+        value = str(self.settings.get("download_source") or "auto")
+        return "mirror_priority" if value == "mirror" else value
 
     def _meta_bases(self, kind: str) -> list[str]:
-        if kind == "fabric":
-            if self.source == "official":
-                return [FABRIC_META]
-            if self.source == "mirror":
-                return [FABRIC_META_MIRROR]
-            # The mirror is generally faster for the primarily Chinese audience
-            # of this launcher, while the official endpoint remains a fallback.
-            return [FABRIC_META_MIRROR, FABRIC_META]
-        if self.source == "official":
-            return [QUILT_META]
-        if self.source == "mirror":
-            return [QUILT_META_MIRROR]
-        return [QUILT_META_MIRROR, QUILT_META]
+        if self.source == "mirror_only":
+            return [FABRIC_META_MIRROR] if kind == "fabric" else [QUILT_META_MIRROR]
+        if self.source == "mirror_priority":
+            return ([FABRIC_META_MIRROR, FABRIC_META] if kind == "fabric"
+                    else [QUILT_META_MIRROR, QUILT_META])
+        if self.source == "official_priority":
+            return ([FABRIC_META, FABRIC_META_MIRROR] if kind == "fabric"
+                    else [QUILT_META, QUILT_META_MIRROR])
+        return [FABRIC_META] if kind == "fabric" else [QUILT_META]
 
     @staticmethod
     def _neoforge_prefix(game_version: str) -> str:
@@ -313,6 +551,8 @@ class LoaderService:
             try:
                 data = request_json(url, timeout=40, context="获取 Fabric 安装配置")
                 if isinstance(data, dict) and data.get("id"):
+                    validate_loader_profile(data, "Fabric")
+                    _ensure_loader_hashes(data, "Fabric")
                     return data
             except Exception as exc:
                 errors.append(str(exc))
@@ -326,6 +566,8 @@ class LoaderService:
             try:
                 data = request_json(url, timeout=40, context="获取 Quilt 安装配置")
                 if isinstance(data, dict) and data.get("id"):
+                    validate_loader_profile(data, "Quilt")
+                    _ensure_loader_hashes(data, "Quilt")
                     return data
             except Exception as exc:
                 errors.append(str(exc))

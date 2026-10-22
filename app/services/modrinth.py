@@ -63,6 +63,25 @@ class ModrinthService:
         return request_json(f"{MODRINTH_API}/project/{project_id}", timeout=30,
                             headers=self.headers, context="读取 Modrinth 工程")
 
+    def projects(self, project_ids: list[str]) -> list[dict[str, Any]]:
+        if not project_ids:
+            return []
+        data = request_json(
+            f"{MODRINTH_API}/projects", timeout=30,
+            params={"ids": json.dumps(project_ids)}, headers=self.headers,
+            context="读取 Modrinth 前置工程",
+        )
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    def version_by_id(self, version_id: str) -> dict[str, Any]:
+        data = request_json(
+            f"{MODRINTH_API}/version/{version_id}", timeout=30,
+            headers=self.headers, context="读取 Modrinth 前置版本",
+        )
+        if not isinstance(data, dict):
+            raise ModrinthError("Modrinth 前置版本格式不正确。")
+        return data
+
     def versions(self, project_id: str, *, game_version: str = "", loader: str = "") -> list[dict[str, Any]]:
         params: dict[str, str] = {}
         if game_version:
@@ -115,7 +134,9 @@ class ModrinthService:
         if not urls:
             raise ModrinthError("下载地址为空。")
         hashes = file.get("hashes") or {}
-        sha1 = hashes.get("sha1")
+        sha1 = str(hashes.get("sha1") or "")
+        if not sha1:
+            raise ModrinthError("Modrinth 文件缺少 SHA-1，已拒绝下载。")
         size = int(file.get("size") or 0)
         return download_file(
             urls, destination, sha1=sha1, size=size or None,
