@@ -21,7 +21,7 @@ from .. import icons
 from ..dialogs import AccountDialog, ConfirmDialog, ProgressJobDialog
 from ..theme import THEMES, Theme
 from ..widgets import (
-    Avatar, Card, InfoBanner, PageHeader, Pill, SectionCard, SettingRow, ThemePreview,
+    Avatar, BrandMark, Card, InfoBanner, PageHeader, Pill, SectionCard, SettingRow, ThemePreview,
     ToggleSwitch, badge, icon_button, label, make_button, repolish,
 )
 
@@ -82,6 +82,7 @@ class SettingsPage(QWidget):
         self.nav_buttons: dict[str, NavItem] = {}
         self.pages: dict[str, QWidget] = {}
         self.theme_tiles: dict[str, QFrame] = {}
+        self.source_warnings: list[InfoBanner] = []
         self._build()
         self.refresh_java()
         self.refresh_accounts()
@@ -153,10 +154,23 @@ class SettingsPage(QWidget):
         if key not in self.pages:
             return
         self.stack.setCurrentWidget(self.pages[key])
+        self._update_source_warnings()
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
             button.setProperty("active", "true" if name == key else "false")
             repolish(button)
+
+    def _mirror_warning(self) -> InfoBanner:
+        banner = InfoBanner(
+            "当前使用第三方 BMCLAPI 镜像源，元数据未经 Mojang 官方签名验证，"
+            "请自行承担风险。", "warning", "shield")
+        banner.setVisible(str(self.settings.get("download_source") or "auto") in {"mirror_priority", "mirror_only"})
+        return banner
+
+    def _update_source_warnings(self) -> None:
+        visible = str(self.settings.get("download_source") or "auto") in {"mirror_priority", "mirror_only"}
+        for banner in self.source_warnings:
+            banner.setVisible(visible)
 
     # ------------------------------------------------------------------ helpers
     def _combo(self, items: list[tuple[str, str]], current: str = "") -> QComboBox:
@@ -219,13 +233,20 @@ class SettingsPage(QWidget):
 
         downloads = SectionCard("下载与网络", "下载源会影响版本清单与依赖库的获取速度。", "download_cloud")
         source_combo = self._combo([
-            ("auto", "自动选择（推荐）"), ("official", "官方源优先"), ("mirror", "BMCLAPI 镜像优先"),
+            ("auto", "自动选择（推荐）"),
+            ("official_priority", "优先官方源"),
+            ("mirror_priority", "优先 BMCLAPI"),
+            ("official", "仅官方源"),
+            ("mirror_only", "仅 BMCLAPI 镜像"),
         ], str(self.settings.get("download_source") or "auto"))
         source_combo.currentIndexChanged.connect(
-            lambda: self._save("download_source", source_combo.currentData(), "下载源已更新"))
+            lambda: (self._save("download_source", source_combo.currentData(), "下载源已更新"),
+                     self._update_source_warnings()))
         downloads.add_row(self._setting_row(
-            "下载源", "自动模式会先尝试官方源，失败后切换到 BMCLAPI；Forge 官方安装器仍使用其官方源。",
+            "下载源", "自动优先官方；优先模式可回退；仅模式不回退。",
             source_combo, "globe"))
+        self.source_warnings.append(self._mirror_warning())
+        downloads.add_widget(self.source_warnings[-1])
         self.parallel_spin = QSpinBox()
         self.parallel_spin.setRange(2, 16)
         self.parallel_spin.setValue(int(self.settings.get("parallel_downloads") or 8))
@@ -445,12 +466,19 @@ class SettingsPage(QWidget):
         scroll, layout = self._new_scroll_page()
         card = SectionCard("下载行为", "控制版本安装与 Modrinth 下载的默认行为。", "download_cloud")
         source_combo = self._combo([
-            ("auto", "自动选择（推荐）"), ("official", "官方源优先"), ("mirror", "BMCLAPI 镜像优先"),
+            ("auto", "自动选择（推荐）"),
+            ("official_priority", "优先官方源"),
+            ("mirror_priority", "优先 BMCLAPI"),
+            ("official", "仅官方源"),
+            ("mirror_only", "仅 BMCLAPI 镜像"),
         ], str(self.settings.get("download_source") or "auto"))
         source_combo.currentIndexChanged.connect(
-            lambda: self._save("download_source", source_combo.currentData(), "下载源已更新"))
+            lambda: (self._save("download_source", source_combo.currentData(), "下载源已更新"),
+                     self._update_source_warnings()))
         card.add_row(self._setting_row("默认下载源", "影响 Mojang 版本清单、支持库与资源文件的获取。",
                                        source_combo, "globe"))
+        self.source_warnings.append(self._mirror_warning())
+        card.add_widget(self.source_warnings[-1])
         parallel_spin = QSpinBox()
         parallel_spin.setRange(2, 16)
         parallel_spin.setValue(int(self.settings.get("parallel_downloads") or 8))
@@ -632,7 +660,7 @@ class SettingsPage(QWidget):
     def _build_appearance(self) -> QWidget:
         scroll, layout = self._new_scroll_page()
         theme_card = SectionCard(
-            "主题", "全部主题免费开放，切换即生效。", "image")
+            "主题", "", "image")
         note = InfoBanner("选择一套配色，立即应用到整个启动器。", "success", "sparkle")
         theme_card.add_widget(note)
         grid = QGridLayout()
@@ -655,6 +683,8 @@ class SettingsPage(QWidget):
             tile_layout.addWidget(preview)
             name_row = QHBoxLayout()
             name_row.setSpacing(4)
+            theme_icon = BrandMark(theme_id, 18)
+            name_row.addWidget(theme_icon)
             name = label(theme.name, "cardTitle")
             name_row.addWidget(name)
             name_row.addStretch()
@@ -875,6 +905,8 @@ class SettingsPage(QWidget):
 
     def set_theme(self, theme: Theme) -> None:
         self.theme = theme
+        for banner in self.source_warnings:
+            banner.set_theme(theme)
         self.refresh_java()
         self.refresh_accounts()
         self.refresh_theme_gallery()

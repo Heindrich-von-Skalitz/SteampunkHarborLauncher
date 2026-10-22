@@ -89,6 +89,7 @@ class ModRow(QFrame):
 class ResourceRow(QFrame):
     delete_requested = pyqtSignal(object)
     open_requested = pyqtSignal(object)
+    toggled = pyqtSignal(object, bool)
 
     def __init__(self, resource: ResourceInfo, theme: Theme, kind: str,
                  parent: QWidget | None = None) -> None:
@@ -118,6 +119,11 @@ class ResourceRow(QFrame):
         size = QLabel(format_size(resource.size))
         size.setStyleSheet(f"color: {theme.text_faint}; font-size: 10px;")
         layout.addWidget(size)
+        if kind == "resourcepacks":
+            self.switch = ToggleSwitch(resource.enabled)
+            self.switch.setToolTip("勾选后进入游戏自动加载这个材质包")
+            self.switch.toggled.connect(lambda checked: self.toggled.emit(resource, checked))
+            layout.addWidget(self.switch)
         open_button = icon_button("folder", "打开所在目录", icon_role="muted", size=14)
         open_button.clicked.connect(lambda: self.open_requested.emit(resource))
         layout.addWidget(open_button)
@@ -504,6 +510,8 @@ class ContentPage(QWidget):
                 row = ResourceRow(resource, self.theme, kind)
                 row.open_requested.connect(self._open_resource)
                 row.delete_requested.connect(lambda r, k=kind: self._delete_resource(r, k))
+                if kind == "resourcepacks":
+                    row.toggled.connect(self._toggle_resourcepack)
                 host_layout.insertWidget(host_layout.count() - 1, row)
             empty.setVisible(not resources)
 
@@ -582,6 +590,19 @@ class ContentPage(QWidget):
             self.shell.toast(str(exc), "error")
         self.refresh()
         self.shell.refresh_content_counts()
+
+    def _toggle_resourcepack(self, resource: Any, checked: bool) -> None:
+        version = self.shell.current_version()
+        if not version:
+            self.shell.toast("请先选择一个版本", "warning")
+            return
+        try:
+            self.shell.mod_manager.set_resourcepack_enabled(version, resource, checked)
+            self.shell.toast(
+                f"已{'加载' if checked else '取消加载'}材质包 {resource.name}", "success")
+        except (LauncherError, OSError) as exc:
+            self.shell.toast(str(exc), "error")
+        self.refresh()
 
     def _delete_mod(self, mod: ModInfo) -> None:
         if not ConfirmDialog.ask(

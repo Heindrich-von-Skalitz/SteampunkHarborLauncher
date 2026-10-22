@@ -19,6 +19,43 @@ import json
 import sys
 import re
 import os
+from urllib.parse import urlparse
+
+_ALLOWED_DOWNLOAD_HOSTS = {
+    "piston-meta.mojang.com", "piston-data.mojang.com",
+    "launcher.mojang.com", "launchermeta.mojang.com",
+    "resources.download.minecraft.net", "libraries.minecraft.net",
+    "launchercontent.mojang.com", "bmclapi2.bangbang93.com",
+    "api.adoptium.net", "github.com", "api.github.com",
+    "codeload.github.com", "raw.githubusercontent.com",
+    "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+    "api.modrinth.com", "cdn.modrinth.com", "cdn-raw.modrinth.com",
+    "api.curseforge.com", "www.curseforge.com",
+    "edge.forgecdn.net", "mediafilez.forgecdn.net", "media.forgecdn.net",
+    "meta.fabricmc.net", "maven.fabricmc.net",
+    "meta.quiltmc.org", "maven.quiltmc.org",
+    "files.minecraftforge.net", "maven.minecraftforge.net",
+    "maven.neoforged.net",
+}
+
+
+def _validate_download_url(url: str) -> None:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(f"Only HTTPS downloads are allowed: {url}")
+    if parsed.username or parsed.password:
+        raise ValueError("Download URL must not contain credentials")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid download port: {url}") from exc
+    if port not in {None, 443}:
+        raise ValueError(f"Download port is not allowed: {url}")
+    if parsed.hostname.lower().rstrip(".") not in _ALLOWED_DOWNLOAD_HOSTS:
+        host = parsed.hostname.lower().rstrip(".")
+        if not (re.fullmatch(r"bmclapi\d*\.bangbang93\.com", host)
+                or re.fullmatch(r"bmclapi\d+\.sakura\.sld\.tw", host)):
+            raise ValueError(f"Download host is not allowlisted: {parsed.hostname}")
 
 if os.name == "nt":
     info = subprocess.STARTUPINFO()  # type: ignore
@@ -48,6 +85,7 @@ def download_file(url: str, path: str, callback: CallbackDict = {}, sha1: str | 
     """
     Downloads a file into the given path. Check sha1 if given.
     """
+    _validate_download_url(url)
     # Check if the Path is outside the given Minecraft Directory
     if minecraft_directory is not None:
         check_path_inside_minecraft_directory(minecraft_directory, path)
@@ -72,6 +110,7 @@ def download_file(url: str, path: str, callback: CallbackDict = {}, sha1: str | 
 
     if r.status_code != 200:
         return False
+    _validate_download_url(r.url)
 
     with open(path, 'wb') as f:
         r.raw.decode_content = True
@@ -295,6 +334,7 @@ def get_requests_response_cache(url: str) -> requests.models.Response:
     """
     Caches the result of request.get(). If a request was made to the same URL within the last hour, the cache will be used, so you don't need to make a request to a URl each timje you call a function.
     """
+    _validate_download_url(url)
     global _requests_response_cache  # noqa: F824
     if url not in _requests_response_cache or (datetime.datetime.now() - _requests_response_cache[url]["datetime"]).total_seconds() / 60 / 60 >= 1:
         r = requests.get(url, headers={"user-agent": get_user_agent()})

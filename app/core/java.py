@@ -405,11 +405,13 @@ class JavaManager:
         binary = assets[0].get("binary") or {}
         package = binary.get("package") or {}
         url = package.get("link")
-        checksum = package.get("checksum")
+        checksum = str(package.get("checksum") or "")
         name = package.get("name") or f"temurin-jre{major_version}.zip"
         size = package.get("size") or 0
         if not url:
             raise LauncherError("Temurin 发布信息缺少下载地址。")
+        if not checksum:
+            raise LauncherError("Temurin 发布信息缺少 SHA-256，已拒绝下载。")
         target_dir = runtimes_dir() / f"temurin-{major_version}"
         target_dir.mkdir(parents=True, exist_ok=True)
         archive_path = cache_dir() / str(name)

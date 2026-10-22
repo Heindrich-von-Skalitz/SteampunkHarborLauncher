@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from ..constants import NEOFORGE_MAVEN
 from ..paths import cache_dir
@@ -19,7 +21,8 @@ from ..services.mojang import LoaderService, MojangService
 from ..storage import Settings
 from ..utils import (
     CancelledError, DownloadError, LauncherError, download_file, format_size,
-    is_windows, read_json, sha1_file, write_json,
+    is_windows, read_json, request_text, safe_child, safe_component, sha1_file,
+    sha256_file, validate_component, write_json,
 )
 from .libraries import collect_library_files, extract_natives, missing_library_files
 from .minecraft import MinecraftManager
@@ -68,6 +71,9 @@ class InstallerService:
         progress = progress or (lambda _p, _m: None)
         log = log or (lambda _m: None)
         cancel = cancel or (lambda: False)
+        version_id = validate_component(version_id, "Minecraft 版本")
+        if loader_version:
+            loader_version = validate_component(loader_version, "加载器版本")
         self.manager.ensure_root()
 
         def scaled(start: int, end: int) -> Progress:
@@ -147,6 +153,7 @@ class InstallerService:
         progress = progress or (lambda _p, _m: None)
         log = log or (lambda _m: None)
         cancel = cancel or (lambda: False)
+        version_id = validate_component(version_id, "Minecraft 版本")
         target = self.manager.create_instance_folder(version_id)
         json_path = target / f"{version_id}.json"
         local_meta = read_json(json_path, None)
@@ -212,10 +219,12 @@ class InstallerService:
         progress(40, "检查资源索引…")
         asset_index_info = meta.get("assetIndex") or {}
         index_id = str(asset_index_info.get("id") or "")
+        if index_id:
+            index_id = safe_component(index_id, "资源索引 ID")
         index_data: dict[str, Any] | None = None
         assets_root = self.manager.root / "assets"
         if index_id:
-            index_path = assets_root / "indexes" / f"{index_id}.json"
+            index_path = safe_child(assets_root / "indexes", f"{index_id}.json")
             index_data = read_json(index_path, None)
             if not isinstance(index_data, dict) or not isinstance(index_data.get("objects"), dict):
                 index_urls = self._asset_index_urls(asset_index_info)
@@ -240,15 +249,15 @@ class InstallerService:
                 if not isinstance(info, dict):
                     continue
                 digest = str(info.get("hash") or "")
-                if len(digest) < 4:
-                    continue
-                path = assets_root / "objects" / digest[:2] / digest
+                if not re.fullmatch(r"[0-9a-fA-F]{40}", digest):
+                    raise LauncherError(f"资源哈希格式非法：{digest[:80]!r}")
+                path = safe_child(assets_root / "objects", f"{digest[:2]}/{digest}")
                 if path.exists() and path.stat().st_size > 0:
                     continue
                 urls = self._asset_urls(digest)
                 asset_specs[str(path).casefold()] = DownloadSpec(
                     path=path, urls=urls, label=name, sha1=digest,
-                    size=int(info.get("size") or 0), check_sha1=False,
+                    size=int(info.get("size") or 0), check_sha1=True,
                 )
             log(f"资源缺失 {len(asset_specs)} 个")
             if asset_specs:
@@ -269,8 +278,9 @@ class InstallerService:
         logging_client = logging.get("client") or {}
         logging_file = logging_client.get("file") or {}
         if logging_file.get("url"):
-            config_id = str(logging_file.get("id") or "client-log4j.xml")
-            config_path = assets_root / "log_configs" / config_id
+            config_id = safe_component(
+                str(logging_file.get("id") or "client-log4j.xml"), "日志配置 ID")
+            config_path = safe_child(assets_root / "log_configs", config_id)
             if not config_path.exists():
                 progress(89, "下载日志配置…")
                 download_file(
@@ -323,6 +333,7 @@ class InstallerService:
         java = Path(java_path)
         if not java_path or not java.is_file():
             raise LauncherError("安装 NeoForge 需要可运行的 Java，请先在设置中检测 Java。")
+        version_id = validate_component(version_id, "Minecraft 版本")
         log(f"NeoForge 安装使用 Java：{java}")
         self.install_vanilla(
             version_id, force=False,
@@ -347,9 +358,10 @@ class InstallerService:
                 progress(37, f"暂无稳定版，使用 NeoForge 测试版…")
         if not all_versions:
             raise LauncherError(f"NeoForge 官方 Maven 尚未发布 Minecraft {version_id} 的版本。")
-        chosen = loader_version.strip() or all_versions[0]
-        if loader_version and chosen not in all_versions:
-            log(f"使用手动指定的 NeoForge 版本 {chosen}")
+        chosen = validate_component(
+            loader_version.strip() or all_versions[0], "NeoForge 版本")
+        if chosen not in all_versions:
+            raise LauncherError(f"NeoForge 版本不在官方列表中：{chosen}")
         log(f"NeoForge 版本：{chosen}（该游戏版本共 {len(all_versions)} 个可用版本）")
 
         install_root = cache_dir() / "neoforge" / chosen
@@ -358,9 +370,27 @@ class InstallerService:
         url = (f"{NEOFORGE_MAVEN}/releases/net/neoforged/neoforge/"
                f"{chosen}/neoforge-{chosen}-installer.jar")
         progress(40, f"下载 NeoForge {chosen} 安装组件…")
+        expected_sha1 = ""
+        expected_sha256 = ""
+        for suffix, target_name in ((".sha256", "sha256"), (".sha1", "sha1")):
+            try:
+                text = request_text(url + suffix, timeout=20,
+                                    context="NeoForge 安装器哈希").strip()
+            except Exception:
+                continue
+            digest = text.split()[0].lower() if text else ""
+            if target_name == "sha256" and len(digest) == 64:
+                expected_sha256 = digest
+                break
+            if target_name == "sha1" and len(digest) == 40:
+                expected_sha1 = digest
+                break
+        if not expected_sha1 and not expected_sha256:
+            raise LauncherError("无法获取 NeoForge 安装器官方哈希，已拒绝执行。")
         try:
             download_file(
                 url, installer, cancel=cancel, context="NeoForge 安装组件",
+                sha1=expected_sha1 or None, sha256=expected_sha256 or None,
                 progress=lambda done, total: progress(
                     40 + int(done / max(1, total) * 10),
                     f"下载 NeoForge 安装组件 · {format_size(done)} / {format_size(total)}"),
@@ -605,40 +635,54 @@ class InstallerService:
         return errors
 
     # ------------------------------------------------------------------ URLs
+    def _source_mode(self) -> str:
+        value = str(self.settings.get("download_source") or "auto")
+        return "mirror_priority" if value == "mirror" else value
+
     def _source_order(self, urls: list[str], *, assets: bool = False) -> list[str]:
-        source = str(self.settings.get("download_source") or "auto")
+        source = self._source_mode()
         unique = [u for u in dict.fromkeys(urls) if u]
         mirrors = [self.mojang.mirror_url(url) for url in unique]
         if source == "official":
             return unique
-        if source == "mirror":
+        if source == "mirror_only":
+            return [u for u in dict.fromkeys(mirrors)
+                    if "bmclapi" in (urlparse(u).hostname or "")]
+        if source == "mirror_priority":
             return list(dict.fromkeys(mirrors + unique))
         return list(dict.fromkeys(unique + mirrors))
 
     def _client_urls(self, version_id: str, original: str | None) -> list[str]:
+        source = self._source_mode()
         urls = []
-        if original:
+        if original and source != "mirror_only":
             urls.append(str(original))
-        urls.append(f"https://bmclapi2.bangbang93.com/version/{version_id}/client")
+        if source != "official":
+            urls.append(f"https://bmclapi2.bangbang93.com/version/{version_id}/client")
         return self._source_order(urls)
 
     def _asset_urls(self, digest: str) -> list[str]:
         official = f"https://resources.download.minecraft.net/{digest[:2]}/{digest}"
         mirror = f"https://bmclapi2.bangbang93.com/assets/{digest[:2]}/{digest}"
-        source = str(self.settings.get("download_source") or "auto")
+        source = self._source_mode()
         if source == "official":
             return [official]
-        if source == "mirror":
+        if source == "mirror_only":
+            return [mirror]
+        if source == "mirror_priority":
             return [mirror, official]
         return [official, mirror]
 
     def _asset_index_urls(self, info: dict[str, Any]) -> list[str]:
+        source = self._source_mode()
         urls = []
-        if info.get("url"):
+        if info.get("url") and source != "mirror_only":
             urls.append(str(info["url"]))
-            urls.append(self.mojang.mirror_url(str(info["url"])))
+            if source != "official":
+                urls.append(self.mojang.mirror_url(str(info["url"])))
         index_id = str(info.get("id") or "")
-        if index_id:
+        if index_id and source != "official":
+            index_id = safe_component(index_id, "资源索引 ID")
             urls.append(f"https://bmclapi2.bangbang93.com/assets/indexes/{index_id}.json")
         return self._source_order(urls)
 
@@ -649,15 +693,20 @@ class InstallerService:
     def _materialize_virtual_assets(self, index_id: str, index_data: dict[str, Any]) -> None:
         if not index_data.get("virtual"):
             return
+        index_id = safe_component(index_id, "资源索引 ID")
         base = self.manager.root / "assets" / "objects"
-        virtual = self.manager.root / "assets" / "virtual" / index_id
+        virtual = safe_child(self.manager.root / "assets" / "virtual", index_id)
         virtual.mkdir(parents=True, exist_ok=True)
         for name, info in (index_data.get("objects") or {}).items():
+            if not isinstance(info, dict):
+                continue
             digest = str(info.get("hash") or "")
-            source = base / digest[:2] / digest
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", digest):
+                raise LauncherError(f"资源哈希格式非法：{digest[:80]!r}")
+            source = safe_child(base, f"{digest[:2]}/{digest}")
             if not source.exists():
                 continue
-            target = virtual / name
+            target = safe_child(virtual, str(name))
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists() or target.stat().st_size != source.stat().st_size:
                 shutil.copyfile(source, target)
