@@ -2,7 +2,7 @@
 
 当前版本：**26-alpha-B.11** · Windows 10 / 11 64 位
 
-> 下载 exe：在本仓库的 **Releases** 页面获取 `SHL-26-alpha-B.10.exe`。
+> 下载 exe：在本仓库的 **Releases** 页面获取
 
 > 下载链接：https://github.com/Heindrich-von-Skalitz/SteampunkHarborLauncher/releases
 
