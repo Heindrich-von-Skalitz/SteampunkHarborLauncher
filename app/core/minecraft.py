@@ -11,7 +11,10 @@ from typing import Any
 
 from ..paths import data_dir
 from ..storage import Settings
-from ..utils import LauncherError, format_size, now_stamp, read_json, required_java_major
+from ..utils import (
+    LauncherError, format_size, now_stamp, read_json, required_java_major,
+    safe_component, validate_component,
+)
 from ..constants import LOADER_NAMES
 
 LOG = logging.getLogger("shl.minecraft")
@@ -110,7 +113,8 @@ class MinecraftManager:
 
     # ------------------------------------------------------------------ inspect
     def _load_version_json(self, version_id: str) -> dict[str, Any]:
-        json_path = self.versions_dir / version_id / f"{version_id}.json"
+        version_id = safe_component(version_id, "版本标识")
+        json_path = self.version_folder(version_id) / f"{version_id}.json"
         data = read_json(json_path, None)
         if not isinstance(data, dict):
             raise LauncherError(f"版本 {version_id} 的 JSON 已损坏或不存在。")
@@ -162,7 +166,8 @@ class MinecraftManager:
         return merged, chain
 
     def inspect(self, version_id: str, *, include_profile: bool = True) -> InstalledVersion:
-        version_dir = self.versions_dir / version_id
+        version_id = safe_component(version_id, "版本标识")
+        version_dir = self.version_folder(version_id)
         json_path = version_dir / f"{version_id}.json"
         data = self._load_version_json(version_id)
         broken = False
@@ -390,10 +395,10 @@ class MinecraftManager:
         return path
 
     def version_folder(self, version_id: str) -> Path:
-        return self.versions_dir / version_id
+        return self.versions_dir / safe_component(version_id, "版本标识")
 
     def create_instance_folder(self, version_id: str) -> Path:
-        path = self.versions_dir / version_id
+        path = self.version_folder(version_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -464,9 +469,11 @@ class MinecraftManager:
         candidates: list[Path] = []
         jar_id = str(version.data.get("jar") or "")
         if jar_id:
+            jar_id = safe_component(jar_id, "JAR 版本标识")
             candidates.append(self.versions_dir / jar_id / f"{jar_id}.jar")
         candidates.append(version.path / f"{version.id}.jar")
-        candidates.append(self.versions_dir / version.base_version / f"{version.base_version}.jar")
+        base_id = safe_component(version.base_version, "基础版本标识")
+        candidates.append(self.versions_dir / base_id / f"{base_id}.jar")
         for _, chain_data in reversed([(x, self._safe_version_json(x)) for x in version.data.get("_chain", [])]):
             if not isinstance(chain_data, dict):
                 continue
@@ -475,6 +482,7 @@ class MinecraftManager:
             if client.get("url"):
                 chain_id = str(chain_data.get("id") or "")
                 if chain_id:
+                    chain_id = safe_component(chain_id, "继承版本标识")
                     candidates.append(self.versions_dir / chain_id / f"{chain_id}.jar")
         for candidate in candidates:
             if candidate and candidate.exists() and candidate.stat().st_size > 0:
@@ -487,7 +495,8 @@ class MinecraftManager:
         return None
 
     def _safe_version_json(self, version_id: str) -> dict[str, Any]:
-        data = read_json(self.versions_dir / version_id / f"{version_id}.json", {})
+        version_id = safe_component(version_id, "继承版本标识")
+        data = read_json(self.version_folder(version_id) / f"{version_id}.json", {})
         return data if isinstance(data, dict) else {}
 
     def assets_index(self, version: InstalledVersion) -> dict[str, Any] | None:

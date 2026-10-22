@@ -165,8 +165,11 @@ class CurseForgeService:
         urls = self.file_urls(file)
         if not urls:
             raise CurseForgeError("CurseForge 没有为这个文件提供下载地址。")
+        sha1 = self.sha1(file)
+        if not sha1:
+            raise CurseForgeError("CurseForge 文件缺少 SHA-1，已拒绝下载。")
         return download_file(
-            urls, destination, sha1=self.sha1(file),
+            urls, destination, sha1=sha1,
             size=int(file.get("fileLength") or 0) or None,
             progress=progress, cancel=cancel,
             context=str(file.get("fileName") or "CurseForge 文件"),

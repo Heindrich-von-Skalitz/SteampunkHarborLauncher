@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..utils import LauncherError, is_windows, rules_allow
+from ..utils import LauncherError, is_windows, rules_allow, safe_child
 
 LOG = logging.getLogger("shl.libraries")
 
@@ -105,7 +105,7 @@ def collect_library_files(meta: dict[str, Any], minecraft_root: Path,
         has_download_section = isinstance(downloads, dict) and bool(
             downloads.get("artifact") is not None or downloads.get("classifiers"))
         if artifact_path:
-            target = libraries_root / artifact_path
+            target = safe_child(libraries_root, str(artifact_path))
             item = LibraryFile(
                 name=name, path=target, urls=[artifact_url] if artifact_url else [],
                 sha1=str(artifact.get("sha1") or ""), size=int(artifact.get("size") or 0),
@@ -115,7 +115,7 @@ def collect_library_files(meta: dict[str, Any], minecraft_root: Path,
         elif name and not has_download_section:
             maven_path = _maven_path(name)
             if maven_path:
-                target = libraries_root / maven_path
+                target = safe_child(libraries_root, maven_path.as_posix())
                 base = str(lib.get("url") or DEFAULT_LIBRARY_BASE)
                 if not base.endswith("/"):
                     base += "/"
@@ -135,7 +135,7 @@ def collect_library_files(meta: dict[str, Any], minecraft_root: Path,
                     native_path_raw = _maven_path(native_name)
                     native_path = native_path_raw.as_posix() if native_path_raw else ""
             if native_path:
-                target = libraries_root / native_path
+                target = safe_child(libraries_root, str(native_path))
                 base = str(lib.get("url") or DEFAULT_LIBRARY_BASE)
                 if not base.endswith("/"):
                     base += "/"

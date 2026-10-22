@@ -234,6 +234,11 @@ THEME_ICON_FILES = {
     "amethyst": "amethyst_shard.png",
     "graphite": "wither_skeleton.png",
     "ivory": "command_block.png",
+    "alloy": "netherite_ingot.png",
+    "cherry": "cherry_sapling.png",
+    "prismarine": "sea_lantern.png",
+    "lush": "glow_berries.png",
+    "end": "chorus_fruit.png",
 }
 
 

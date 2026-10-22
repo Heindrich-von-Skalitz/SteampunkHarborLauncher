@@ -52,7 +52,7 @@ def _protect_text(value: str, *, encrypt: bool) -> str:
             if not crypt32.CryptProtectData(
                     ctypes.byref(source_blob), "SteampunkHarborLauncher", None, None, None, 0,
                     ctypes.byref(output)):
-                return value
+                raise OSError("DPAPI 加密失败，拒绝保存明文令牌")
             try:
                 cipher = ctypes.string_at(output.pbData, output.cbData)
             finally:
@@ -77,8 +77,10 @@ def _protect_text(value: str, *, encrypt: bool) -> str:
             kernel32.LocalFree.argtypes = [ctypes.c_void_p]
             kernel32.LocalFree.restype = ctypes.c_void_p
             kernel32.LocalFree(ctypes.cast(output.pbData, ctypes.c_void_p))
-    except Exception:
-        return value if encrypt else ("" if str(value).startswith("dpapi:") else value)
+    except Exception as exc:
+        if encrypt:
+            raise OSError("DPAPI 加密失败，拒绝保存明文令牌") from exc
+        return "" if str(value).startswith("dpapi:") else value
 
 
 def _account_for_disk(account: dict[str, Any]) -> dict[str, Any]:
@@ -239,6 +241,13 @@ class Settings:
             if key not in self.data:
                 self.data[key] = value
                 changed = True
+        if self.data.get("download_source") == "mirror":
+            self.data["download_source"] = "mirror_priority"
+            changed = True
+        if self.data.get("download_source") not in {
+                "auto", "official_priority", "mirror_priority", "official", "mirror_only"}:
+            self.data["download_source"] = "auto"
+            changed = True
         if legacy_layout and str(self.data.get("minecraft_dir_mode") or "current") == "current":
             # Older releases used the executable folder itself. The portable
             # layout now gets its own .minecraft subfolder; files are not moved

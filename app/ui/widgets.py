@@ -283,7 +283,7 @@ class Avatar(QWidget):
 
 
 class BrandMark(QWidget):
-    """Theme mark: static for all themes except the four-frame command block."""
+    """Theme mark: static for most themes; command block/sea lantern animate."""
 
     def __init__(self, theme_id: str = "creeper", size: int = 30,
                  parent: QWidget | None = None) -> None:
@@ -311,10 +311,10 @@ class BrandMark(QWidget):
         self._timer.stop()
         self._frame = 0
         self._pixmap = QPixmap(str(icons.theme_icon_path(theme_id)))
-        self._frame_count = (
-            4 if theme_id == "ivory" and self._pixmap.height() >= 64 else 1
-        )
+        frames = {"ivory": 4, "prismarine": 5}.get(theme_id, 1)
+        self._frame_count = frames if self._pixmap.height() >= frames * 16 else 1
         if self._frame_count > 1:
+            self._timer.setInterval(160 if theme_id == "prismarine" else 500)
             self._timer.start()
         self.update()
 
@@ -1000,9 +1000,14 @@ class ToastCard(QFrame):
         self.message = label(text, "muted", wrap=True)
         self.message.setMaximumWidth(460)
         self.message.setMinimumWidth(180)
+        self.message.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                   QSizePolicy.Policy.Preferred)
         layout.addWidget(self.message, 1)
         self.setMinimumWidth(280)
-        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(44)
+        self.setMaximumWidth(560)
+        self.setMaximumHeight(180)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
 
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
