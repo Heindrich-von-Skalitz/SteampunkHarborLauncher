@@ -4,7 +4,7 @@ APP_NAME = "机械冒险港启动器"
 APP_NAME_EN = "Steampunk Harbor Launcher"
 APP_BUILD_NAME = "SHL"
 APP_ID = "steampunk-harbor-launcher"
-APP_VERSION = "26-alpha-B.11"
+APP_VERSION = "26.1"
 APP_BUILD = "2026.10.21"
 
 # Developer-only test mode. Change this line in source to True when testing:
@@ -55,6 +55,11 @@ THEME_NAMES = {
     "amethyst": "紫水晶",
     "graphite": "石墨灰",
     "ivory": "象牙白",
+    "alloy": "下界合金",
+    "cherry": "樱花粉",
+    "prismarine": "海晶蓝",
+    "lush": "繁茂绿",
+    "end": "末地紫",
 }
 
 LOADER_NAMES = {

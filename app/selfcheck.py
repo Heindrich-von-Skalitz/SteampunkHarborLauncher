@@ -99,6 +99,16 @@ def run_self_check(output: str | Path | None = None) -> int:
         for spinner in spinners:
             spinner._tick()
         report["checks"].append({"name": "qt_ui_constructed", "ok": True})
+        task_ok = False
+        try:
+            task_key = window.begin_download_task("self-check")
+            task_ok = (bool(window._download_tasks)
+                       and hasattr(window, "_download_seq")
+                       and window.tasks_page is not None)
+            window.finish_download_task(task_key)
+        except Exception:
+            task_ok = False
+        report["checks"].append({"name": "download_task_registry", "ok": task_ok})
         report["checks"].append({
             "name": "gear_spinner_timer",
             "ok": all(hasattr(item, "_angle") for item in spinners),

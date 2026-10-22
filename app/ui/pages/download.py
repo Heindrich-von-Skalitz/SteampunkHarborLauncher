@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import html
 import re
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QStringListModel, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QApplication, QComboBox, QCompleter, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QDesktopServices
@@ -497,7 +499,35 @@ class GameVersionsTab(QWidget):
 
 
 def _source_label(value: str) -> str:
-    return {"auto": "自动选择", "official": "官方源优先", "mirror": "BMCLAPI 镜像优先"}.get(value, value)
+    return {"auto": "自动选择", "official_priority": "优先官方源",
+            "mirror_priority": "优先 BMCLAPI", "official": "仅官方源",
+            "mirror_only": "仅 BMCLAPI 镜像"}.get(value, value)
+
+
+def _required_dependencies(row: dict[str, Any]) -> list[str]:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    if str(row.get("source")) == "curseforge":
+        return [str(item.get("modId") or "") for item in (raw.get("dependencies") or [])
+                if isinstance(item, dict) and int(item.get("relationType") or 0) == 3]
+    return [str(item.get("project_id") or item.get("version_id") or "")
+            for item in (raw.get("dependencies") or [])
+            if isinstance(item, dict) and item.get("dependency_type") == "required"]
+
+
+def _dependency_html(row: dict[str, Any], color: str = "#2F7D3A") -> str:
+    links = row.get("dep_links") or [
+        (name, "") for name in (row.get("dep_names") or _required_dependencies(row))
+    ]
+    parts = []
+    for name, url in links:
+        label = html.escape(str(name))
+        if url:
+            parts.append(
+                f'<a href="{html.escape(str(url))}" '
+                f'style="color:{color};text-decoration:none;font-weight:600;">{label}</a>')
+        else:
+            parts.append(label)
+    return "、".join(parts)
 
 
 class ProjectVersionsDialog(BaseDialog):
@@ -505,14 +535,17 @@ class ProjectVersionsDialog(BaseDialog):
 
     def __init__(self, theme: Theme, shell: Any, hit: dict[str, Any],
                  project_type: str, target_version: str = "",
+                 instance: Any = None, typed_version: str = "",
                  parent: QWidget | None = None) -> None:
         super().__init__(theme, str(hit.get("title") or "项目版本"),
-                         "选择任意历史版本安装；非整合包按 Minecraft 版本分组",
-                         width=820, height=680, icon_name="layers", parent=parent)
+                         "", width=820, height=680, icon_name="layers", parent=parent)
         self.shell = shell
         self.hit = hit
         self.project_type = project_type
         self.target_version = target_version
+        self.instance = instance
+        self.typed_version = typed_version
+        self._dep_hits: dict[str, dict[str, Any]] = {}
         self.rows: list[dict[str, Any]] = []
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -536,21 +569,64 @@ class ProjectVersionsDialog(BaseDialog):
         def job(progress, cancel):
             if source == "curseforge":
                 files = self.shell.curseforge.files(project_id)
-                return [{
+                rows = [{
                     "mc": (item.get("gameVersions") or [""])[0],
                     "loader": "",
                     "title": str(item.get("fileName") or item.get("displayName") or ""),
                     "date": str(item.get("fileDate") or ""),
                     "raw": item, "source": "curseforge",
                 } for item in files]
-            versions = self.shell.modrinth.versions(project_id)
-            return [{
-                "mc": (item.get("game_versions") or [""])[0],
-                "loader": ", ".join(str(x) for x in (item.get("loaders") or [])[:2]),
-                "title": str(item.get("name") or item.get("version_number") or "未命名版本"),
-                "date": str(item.get("date_published") or ""),
-                "raw": item, "source": "modrinth",
-            } for item in versions]
+            else:
+                versions = self.shell.modrinth.versions(project_id)
+                rows = [{
+                    "mc": (item.get("game_versions") or [""])[0],
+                    "loader": ", ".join(str(x) for x in (item.get("loaders") or [])[:2]),
+                    "title": str(item.get("name") or item.get("version_number") or "未命名版本"),
+                    "date": str(item.get("date_published") or ""),
+                    "raw": item, "source": "modrinth",
+                } for item in versions]
+            dep_ids: list[str] = []
+            for row in rows:
+                dep_ids.extend(_required_dependencies(row))
+            names: dict[str, str] = {}
+            targets: dict[str, str] = {}
+            hits: dict[str, dict[str, Any]] = {}
+            try:
+                if dep_ids and source == "curseforge":
+                    for item in self.shell.curseforge.mods(dep_ids):
+                        key = str(item.get("id") or "")
+                        label = str(item.get("name") or key)
+                        target = f"shl-dep:curseforge:{key}"
+                        names[key] = label
+                        targets[key] = target
+                        hits[target] = {
+                            "source": "curseforge", "project_id": key,
+                            "slug": str(item.get("slug") or ""), "title": label,
+                            "project_type": "mod",
+                        }
+                elif dep_ids:
+                    for item in self.shell.modrinth.projects(dep_ids):
+                        key = str(item.get("id") or "")
+                        label = str(item.get("title") or item.get("slug") or key)
+                        target = f"shl-dep:modrinth:{key}"
+                        names[key] = label
+                        targets[key] = target
+                        hits[target] = {
+                            "source": "modrinth", "project_id": key,
+                            "slug": str(item.get("slug") or key), "title": label,
+                            "project_type": "mod",
+                        }
+            except Exception:
+                names = {}
+                targets = {}
+                hits = {}
+            for row in rows:
+                dep_ids_row = _required_dependencies(row)
+                row["dep_links"] = [(names.get(dep, dep), targets.get(dep, ""))
+                                    for dep in dep_ids_row]
+                row["dep_names"] = [name for name, _target in row["dep_links"]]
+                row["dep_hits"] = hits
+            return rows
 
         run_task(self, job, on_done=self._render, on_error=self._failed,
                  name="project-versions")
@@ -570,7 +646,30 @@ class ProjectVersionsDialog(BaseDialog):
             self.status.setText("这个项目没有可下载版本。")
             self.list_layout.addWidget(label("没有可下载版本", "faint"))
             return
-        self.status.setText(f"共 {len(rows)} 个版本 · 点击安装")
+        has_deps = any(row.get("dep_names") or _required_dependencies(row) for row in rows)
+        all_dep_links: list[tuple[str, str]] = []
+        seen_links: set[tuple[str, str]] = set()
+        for row in rows:
+            self._dep_hits.update(row.get("dep_hits") or {})
+            for name, target in (row.get("dep_links") or []):
+                key = (str(name), str(target))
+                if key not in seen_links:
+                    seen_links.add(key)
+                    all_dep_links.append(key)
+        if all_dep_links:
+            banner = InfoBanner("", "info", "package")
+            banner.text.setText(
+                "所需前置：" + _dependency_html(
+                    {"dep_links": all_dep_links}, self.theme.accent))
+            banner.text.setTextFormat(Qt.TextFormat.RichText)
+            banner.text.setOpenExternalLinks(False)
+            banner.text.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextBrowserInteraction)
+            banner.text.linkActivated.connect(self._open_dependency)
+            self.list_layout.addWidget(banner)
+        self.status.setText(
+            f"共 {len(rows)} 个版本 · 选择后{ '安装' if self.project_type == 'modpack' else '下载' }"
+            + (" · 每个版本下列出 required 前置" if has_deps else ""))
         if self.project_type == "modpack":
             for row in sorted(rows, key=lambda x: str(x.get("date") or ""), reverse=True):
                 self.list_layout.addWidget(self._row_widget(row))
@@ -596,8 +695,9 @@ class ProjectVersionsDialog(BaseDialog):
                 wrapper = QWidget()
                 wrapper.setLayout(header)
                 self.list_layout.addWidget(wrapper)
-                for row in sorted(groups[version],
-                                  key=lambda x: str(x.get("date") or ""), reverse=True):
+                group_rows = sorted(
+                    groups[version], key=lambda x: str(x.get("date") or ""), reverse=True)
+                for row in group_rows:
                     self.list_layout.addWidget(self._row_widget(row))
         self.list_layout.addStretch()
 
@@ -610,17 +710,52 @@ class ProjectVersionsDialog(BaseDialog):
         col = QVBoxLayout()
         col.setSpacing(2)
         col.addWidget(label(str(row.get("title") or "未命名"), "muted"))
-        meta = " · ".join(part for part in (
-            f"Minecraft {row.get('mc')}" if row.get("mc") else "",
-            str(row.get("loader") or ""),
-            _date_label(str(row.get("date") or "")),
-        ) if part)
-        col.addWidget(label(meta, "faint"))
+        dep_names = row.get("dep_names") or _required_dependencies(row)
+        meta_parts = [
+            f"Minecraft {html.escape(str(row.get('mc')))}" if row.get("mc") else "",
+            html.escape(str(row.get("loader") or "")),
+            html.escape(_date_label(str(row.get("date") or ""))),
+        ]
+        if dep_names:
+            meta_parts.append("前置：" + _dependency_html(row, self.theme.accent))
+        meta = " · ".join(part for part in meta_parts if part)
+        meta_label = label("", "faint", wrap=True)
+        meta_label.setText(meta)
+        meta_label.setTextFormat(Qt.TextFormat.RichText)
+        meta_label.setOpenExternalLinks(False)
+        meta_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        meta_label.linkActivated.connect(self._open_dependency)
+        col.addWidget(meta_label)
         layout.addLayout(col, 1)
-        install = make_button("安装", "secondary", "download", "muted", 13)
-        install.clicked.connect(lambda: self._install(row))
-        layout.addWidget(install)
+        label_text = ("安装" if self.project_type == "modpack"
+                      else ("下载到实例" if self.instance is not None else "下载"))
+        action = make_button(label_text, "secondary", "download", "muted", 13)
+        if self.project_type == "modpack":
+            action.clicked.connect(lambda: self._install(row))
+        else:
+            action.clicked.connect(lambda: self._download(row))
+        layout.addWidget(action)
         return frame
+
+    def _open_dependency(self, target: str) -> None:
+        hit = self._dep_hits.get(str(target))
+        if not hit:
+            return
+        dialog = ProjectVersionsDialog(
+            self.theme, self.shell, hit, "mod",
+            target_version=self.target_version, instance=self.instance, parent=self)
+        dialog.exec()
+
+    def _download(self, row: dict[str, Any]) -> None:
+        if self.project_type == "mod" and self.instance is not None:
+            self.shell.download_mod_version_with_plan(
+                self.hit, self.instance, row.get("raw"), str(row.get("source") or "modrinth"))
+            self.status.setText("正在解析该版本的前置；确认后开始下载。")
+            return
+        self.shell.download_content_project(
+            self.hit, self.project_type, row.get("raw"), instance=self.instance,
+            parent=self)
+        self.status.setText("已开始下载；关闭窗口不会中断。")
 
     def _install(self, row: dict[str, Any]) -> None:
         if str(row.get("source")) == "curseforge":
@@ -639,11 +774,13 @@ class ProjectCard(QFrame):
 
     def __init__(self, hit: dict[str, Any], project_type: str, theme: Theme,
                  compatible_current: bool = False,
+                 install_available: bool = True,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.hit = hit
         self.project_type = project_type
         self.theme = theme
+        self.install_available = install_available
         self.setObjectName("ProjectCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumHeight(144)
@@ -702,9 +839,15 @@ class ProjectCard(QFrame):
         version_label = QLabel(version_text)
         version_label.setStyleSheet(f"color: {theme.text_faint}; font-size: 9px;")
         bottom.addWidget(version_label, 1)
-        self.install_button = make_button("安装", "install", "download", "accent", 13)
-        self.install_button.clicked.connect(lambda: self.install_requested.emit(self.hit))
-        bottom.addWidget(self.install_button)
+        self.install_button = None
+        if project_type in {"modpack", "resourcepack", "shader"} or not install_available:
+            select = make_button("选择版本", "secondary", "layers", "muted", 13)
+            select.clicked.connect(lambda: self.detail_requested.emit(self.hit))
+            bottom.addWidget(select)
+        else:
+            self.install_button = make_button("安装", "install", "download", "accent", 13)
+            self.install_button.clicked.connect(lambda: self.install_requested.emit(self.hit))
+            bottom.addWidget(self.install_button)
         body.addLayout(bottom)
         layout.addLayout(body, 1)
 
@@ -714,8 +857,16 @@ class ProjectCard(QFrame):
         super().mouseReleaseEvent(event)
 
     def set_installing(self, busy: bool, text: str = "下载中…") -> None:
-        self.install_button.setEnabled(not busy)
-        self.install_button.setText(text if busy else "安装")
+        if self.install_button is None:
+            return
+        try:
+            from PyQt6 import sip
+            if sip.isdeleted(self.install_button):
+                return
+            self.install_button.setEnabled(not busy)
+            self.install_button.setText(text if busy else "安装")
+        except RuntimeError:
+            return
 
 
 class ContentTab(QWidget):
@@ -758,7 +909,19 @@ class ContentTab(QWidget):
         top.addWidget(label("目标版本", "faint"))
         self.version_combo = QComboBox()
         self.version_combo.setMinimumWidth(170)
+        self.version_combo.setEditable(True)
+        self.version_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if self.version_combo.lineEdit() is not None:
+            self.version_combo.lineEdit().setPlaceholderText("输入 1.2 选择候选版本")
+        self.version_completer = QCompleter(self.version_combo)
+        self.version_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.version_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.version_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.version_combo.setCompleter(self.version_completer)
+        self._known_versions: set[str] = set()
+        self._custom_version = False
         self.version_combo.currentIndexChanged.connect(self._version_changed)
+        self.version_combo.editTextChanged.connect(self._version_text_edited)
         top.addWidget(self.version_combo)
         top.addWidget(label("加载器", "faint"))
         self.loader_combo = QComboBox()
@@ -781,11 +944,13 @@ class ContentTab(QWidget):
         note_row = QHBoxLayout()
         self.result_count = label("输入关键词，或者直接搜索热门项目", "faint")
         note_row.addWidget(self.result_count, 1)
-        source = Pill("Modrinth + CurseForge", "secondary")
-        source.set_theme(self.theme)
-        note_row.addWidget(source)
         filter_layout.addLayout(note_row)
         layout.addWidget(filter_frame)
+        self.version_banner = InfoBanner(
+            "请选择候选版本；直接输入完整版本号或从下拉候选中选择。",
+            "warning", "info")
+        self.version_banner.hide()
+        layout.addWidget(self.version_banner)
         self.banner = InfoBanner("", "info", "shield")
         self.banner.hide()
         layout.addWidget(self.banner)
@@ -835,6 +1000,16 @@ class ContentTab(QWidget):
                     self.version_combo.setCurrentIndex(index)
             else:
                 self.version_combo.setCurrentIndex(0)
+            candidates = {str(v.base_version) for v in self.shell.versions if v.base_version}
+            for entry in (getattr(self.shell, "manifest_versions", None) or []):
+                if isinstance(entry, dict) and entry.get("id"):
+                    candidates.add(str(entry["id"]))
+            if version and version.base_version:
+                candidates.add(str(version.base_version))
+            self._known_versions = candidates
+            self.version_completer.setModel(
+                QStringListModel(sorted(candidates), self.version_completer))
+            self._custom_version = False
             loader = version.primary_loader if version and version.loaders else ""
             index = self.loader_combo.findData(loader or "auto")
             if index >= 0:
@@ -846,24 +1021,72 @@ class ContentTab(QWidget):
     def _version_changed(self, index: int) -> None:
         version_id = self.version_combo.itemData(index)
         if version_id:
+            self._custom_version = False
             self.shell.set_current_version(str(version_id), notify=False)
             self.refresh_filters()
         self.search(reset=True)
 
+    def _version_text_edited(self, text: str) -> None:
+        cleaned = text.strip()
+        self._custom_version = bool(
+            cleaned and cleaned != "全部版本" and not self._selected_item_matches())
+        if not cleaned or cleaned == "全部版本":
+            self.version_banner.hide()
+            self._search_timer.start()
+            return
+        self.version_completer.setCompletionPrefix(cleaned)
+        if cleaned not in self._known_versions:
+            self._search_timer.stop()
+            self.version_banner.show()
+            self.version_banner.set_text(
+                "请从候选版本中选择，例如 1.20.1；不会把任意文本发给内容源。")
+            self.version_banner.update()
+            self.version_completer.complete()
+            return
+        self.version_banner.hide()
+        self._search_timer.start()
+
+    def _version_valid(self) -> bool:
+        text = self.version_combo.currentText().strip()
+        if not text or text == "全部版本":
+            return True
+        if self._selected_item_matches():
+            return True
+        return text in self._known_versions
+
+    def _selected_item_matches(self) -> bool:
+        index = self.version_combo.currentIndex()
+        if index < 0 or not self.version_combo.currentData():
+            return False
+        return self.version_combo.currentText().strip() == self.version_combo.itemText(index)
+
+    def _version_text(self) -> str:
+        text = self.version_combo.currentText().strip()
+        return text if text in self._known_versions else ""
+
+    def _is_custom_version(self) -> bool:
+        return bool(self._custom_version and self._version_text())
+
     def _current_instance(self):
-        version_id = self.version_combo.currentData() if hasattr(self, "version_combo") else None
+        if self._custom_version:
+            return None
+        if self.version_combo.currentIndex() < 0:
+            return None
+        version_id = self.version_combo.currentData()
         if not version_id:
             return None
         return self.shell.minecraft.find(str(version_id)) or self.shell.current_version()
 
+    def _install_available(self) -> bool:
+        return bool(self._current_instance()) and not self._is_custom_version()
+
     def _target_game_version(self) -> str:
-        version_id = self.version_combo.currentData() if hasattr(self, "version_combo") else None
-        if not version_id:
-            # "尚未安装版本" must not silently filter by the newest Minecraft
-            # release; that hides Create and most other mods.
-            return ""
+        if self._is_custom_version():
+            return self._version_text()
         version = self._current_instance()
-        return version.base_version if version else ""
+        if version:
+            return version.base_version
+        return ""
 
     def _loader_facet(self) -> str:
         value = self.loader_combo.currentData()
@@ -873,6 +1096,13 @@ class ContentTab(QWidget):
         return str(value or "")
 
     def search(self, *, reset: bool = True) -> None:
+        if not self._version_valid():
+            self.version_banner.show()
+            self.version_banner.set_text(
+                "请从候选版本中选择，例如 1.20.1；不会把任意文本发给内容源。")
+            self.version_banner.update()
+            return
+        self.version_banner.hide()
         if reset:
             self.offset = 0
             self.page_index = 0
@@ -998,7 +1228,8 @@ class ContentTab(QWidget):
             versions = _sorted_game_versions(hit.get("versions") or [])
             compatible = bool(current and current in versions)
             card = ProjectCard(hit, self.project_type, self.theme,
-                               compatible_current=compatible)
+                               compatible_current=compatible,
+                               install_available=self._install_available())
             card.install_requested.connect(self._install)
             card.open_requested.connect(self._open_page)
             card.detail_requested.connect(self._open_versions)
@@ -1011,7 +1242,10 @@ class ContentTab(QWidget):
     def _open_versions(self, hit: dict[str, Any]) -> None:
         dialog = ProjectVersionsDialog(
             self.theme, self.shell, hit, self.project_type,
-            target_version=self._target_game_version(), parent=self)
+            target_version=self._target_game_version(),
+            instance=self._current_instance(),
+            typed_version=self._version_text() if self._is_custom_version() else "",
+            parent=self)
         dialog.exec()
 
     def _ensure_stretch(self) -> None:
@@ -1051,7 +1285,14 @@ class ContentTab(QWidget):
             elif slug:
                 url = ModrinthService.project_url(str(slug))
         if url:
-            QDesktopServices.openUrl(QUrl(url))
+            parsed = urlparse(url)
+            if parsed.scheme == "https" and parsed.hostname in {
+                    "modrinth.com", "www.modrinth.com",
+                    "curseforge.com", "www.curseforge.com",
+                    "minecraft.net", "www.minecraft.net"}:
+                QDesktopServices.openUrl(QUrl(url))
+            else:
+                self.page.shell.toast("项目链接不在允许的网站列表中。", "warning")
 
     def on_shown(self) -> None:
         self.refresh_filters()
@@ -1100,6 +1341,11 @@ class DownloadPage(QWidget):
         self.switcher.changed.connect(self._switch_tab)
         self.header.add_action(self.switcher)
         outer.addWidget(self.header)
+        self.mirror_banner = InfoBanner(
+            "当前使用第三方 BMCLAPI 镜像源，元数据未经 Mojang 官方签名验证，"
+            "请自行承担风险。", "warning", "shield")
+        self.mirror_banner.hide()
+        outer.addWidget(self.mirror_banner)
         self.stack = QStackedWidget()
         self.game_tab = GameVersionsTab(self)
         self.stack.addWidget(self.game_tab)
@@ -1118,11 +1364,15 @@ class DownloadPage(QWidget):
         tab.on_shown()
 
     def refresh_dynamic(self) -> None:
+        mirror_only = str(self.shell.settings.get("download_source") or "auto") in {"mirror_priority", "mirror_only"}
+        self.mirror_banner.setVisible(mirror_only)
         for tab in self.tabs.values():
             tab.refresh_filters()
         self.game_tab._render()
 
     def on_shown(self) -> None:
+        mirror_only = str(self.shell.settings.get("download_source") or "auto") in {"mirror_priority", "mirror_only"}
+        self.mirror_banner.setVisible(mirror_only)
         if self.stack.currentWidget() is self.game_tab:
             if not self.game_tab.versions:
                 self.game_tab.load()
@@ -1134,6 +1384,7 @@ class DownloadPage(QWidget):
     def set_theme(self, theme: Theme) -> None:
         self.theme = theme
         self.source_pill.set_theme(theme)
+        self.mirror_banner.set_theme(theme)
         self.game_tab.theme = theme
         self.game_tab.info_banner.set_theme(theme)
         if self.game_tab.versions:

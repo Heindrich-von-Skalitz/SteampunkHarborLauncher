@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -14,14 +15,15 @@ from PyQt6.QtWidgets import (
 )
 
 from ...constants import APP_AUTHOR, APP_NAME, APP_NAME_EN, APP_VERSION
+from ...i18n import LANGUAGES
 from ...core.java import JavaInfo
-from ...paths import ensure_launcher_metadata
-from ...utils import LauncherError, format_size, open_path
+from ...paths import ensure_launcher_metadata, icons_dir
+from ...utils import LauncherError, format_size, open_path, sha256_file
 from .. import icons
 from ..dialogs import AccountDialog, ConfirmDialog, ProgressJobDialog
 from ..theme import THEMES, Theme
 from ..widgets import (
-    Avatar, Card, InfoBanner, PageHeader, Pill, SectionCard, SettingRow, ThemePreview,
+    Avatar, BrandMark, Card, InfoBanner, PageHeader, Pill, SectionCard, SettingRow, ThemePreview,
     ToggleSwitch, badge, icon_button, label, make_button, repolish,
 )
 
@@ -42,7 +44,9 @@ class NavItem(QPushButton):
 
 class CreditRow(QWidget):
     def __init__(self, letter: str, title: str, detail: str, link_text: str = "",
-                 link_url: str = "", badge_text: str = "", parent: QWidget | None = None) -> None:
+                 link_url: str = "", badge_text: str = "",
+                 image_path: Path | str | None = None,
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 9, 0, 9)
@@ -54,6 +58,15 @@ class CreditRow(QWidget):
             "background: #EEF6EF; color: #2F7D3A; border: 1px solid #DCE9DE;"
             " border-radius: 7px; font-family: 'Microsoft YaHei UI', 'Segoe UI';"
             " font-size: 15px; font-weight: 700;")
+        if image_path:
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                avatar.setPixmap(pixmap.scaled(
+                    38, 38, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+                avatar.setStyleSheet(
+                    "background: transparent; border: 1px solid #DCE9DE;"
+                    " border-radius: 7px;")
         layout.addWidget(avatar)
         col = QVBoxLayout()
         col.setSpacing(1)
@@ -82,6 +95,7 @@ class SettingsPage(QWidget):
         self.nav_buttons: dict[str, NavItem] = {}
         self.pages: dict[str, QWidget] = {}
         self.theme_tiles: dict[str, QFrame] = {}
+        self.source_warnings: list[InfoBanner] = []
         self._build()
         self.refresh_java()
         self.refresh_accounts()
@@ -153,10 +167,23 @@ class SettingsPage(QWidget):
         if key not in self.pages:
             return
         self.stack.setCurrentWidget(self.pages[key])
+        self._update_source_warnings()
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
             button.setProperty("active", "true" if name == key else "false")
             repolish(button)
+
+    def _mirror_warning(self) -> InfoBanner:
+        banner = InfoBanner(
+            "当前使用第三方 BMCLAPI 镜像源，元数据未经 Mojang 官方签名验证，"
+            "请自行承担风险。", "warning", "shield")
+        banner.setVisible(str(self.settings.get("download_source") or "auto") in {"mirror_priority", "mirror_only"})
+        return banner
+
+    def _update_source_warnings(self) -> None:
+        visible = str(self.settings.get("download_source") or "auto") in {"mirror_priority", "mirror_only"}
+        for banner in self.source_warnings:
+            banner.setVisible(visible)
 
     # ------------------------------------------------------------------ helpers
     def _combo(self, items: list[tuple[str, str]], current: str = "") -> QComboBox:
@@ -175,6 +202,37 @@ class SettingsPage(QWidget):
 
     def _setting_row(self, title: str, desc: str, control: QWidget, icon_name: str = "") -> SettingRow:
         return SettingRow(title, desc, control, icon_name or None)
+
+    def _executable_hash(self) -> str:
+        cached = getattr(self, "_exe_hash_cache", "")
+        if cached:
+            return cached
+        argv0 = Path(sys.argv[0])
+        packaged = (getattr(sys, "frozen", False)
+                    or "__compiled__" in globals()
+                    or argv0.suffix.lower() == ".exe")
+        if not packaged:
+            value = "开发运行（未打包 exe）"
+        else:
+            executable = None
+            for candidate in (argv0, Path(sys.executable)):
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                if (resolved.is_file() and resolved.suffix.lower() == ".exe"
+                        and not resolved.name.lower().startswith("python")):
+                    executable = resolved
+                    break
+            if executable is None:
+                value = "无法定位打包后的 exe"
+            else:
+                try:
+                    value = sha256_file(executable)
+                except OSError as exc:
+                    value = f"读取失败：{exc}"
+        self._exe_hash_cache = value
+        return value
 
     def _open(self, path: Path | str) -> None:
         try:
@@ -215,17 +273,49 @@ class SettingsPage(QWidget):
         game.add_row(self._setting_row(
             "启动器数据目录", "配置、日志与下载缓存会保存在这里。",
             data_button, "save"))
+        logs_button = make_button("打开日志目录", "ghost", "log", "accent", 13)
+        logs_button.clicked.connect(lambda: self._open(self.shell.logs_dir()))
+        game.add_row(self._setting_row(
+            "启动器日志目录", "launcher.log 与游戏日志保存在这里，排错时可直接打开。",
+            logs_button, "log"))
         layout.addWidget(game)
+
+        language_combo = self._combo(
+            [(key, name) for key, name in LANGUAGES.items()],
+            str(self.settings.get("language") or "zh_JT"))
+        language_combo.currentIndexChanged.connect(
+            lambda: (self._save("language", language_combo.currentData(), "语言已保存"),
+                     self.shell.toast("语言将在重启启动器后生效。", "info", 5000)))
+        game.add_row(self._setting_row(
+            "语言 / Language", "简体中文、繁體中文、English；重启后生效。",
+            language_combo, "globe"))
+        game_language = ToggleSwitch(
+            bool(self.settings.get("apply_language_to_new_versions", True)))
+        game_language.toggled.connect(
+            lambda checked: self._save(
+                "apply_language_to_new_versions", bool(checked),
+                "新版本语言设置已保存"))
+        game.add_row(self._setting_row(
+            "新版本跟随启动器语言",
+            "下载完成后写入该版本 options.txt 的 lang；繁體中文使用香港繁中。",
+            game_language, "globe"))
 
         downloads = SectionCard("下载与网络", "下载源会影响版本清单与依赖库的获取速度。", "download_cloud")
         source_combo = self._combo([
-            ("auto", "自动选择（推荐）"), ("official", "官方源优先"), ("mirror", "BMCLAPI 镜像优先"),
+            ("auto", "自动选择（推荐）"),
+            ("official_priority", "优先官方源"),
+            ("mirror_priority", "优先 BMCLAPI"),
+            ("official", "仅官方源"),
+            ("mirror_only", "仅 BMCLAPI 镜像"),
         ], str(self.settings.get("download_source") or "auto"))
         source_combo.currentIndexChanged.connect(
-            lambda: self._save("download_source", source_combo.currentData(), "下载源已更新"))
+            lambda: (self._save("download_source", source_combo.currentData(), "下载源已更新"),
+                     self._update_source_warnings()))
         downloads.add_row(self._setting_row(
-            "下载源", "自动模式会先尝试官方源，失败后切换到 BMCLAPI；Forge 官方安装器仍使用其官方源。",
+            "下载源", "自动优先官方；优先模式可回退；仅模式不回退。",
             source_combo, "globe"))
+        self.source_warnings.append(self._mirror_warning())
+        downloads.add_widget(self.source_warnings[-1])
         self.parallel_spin = QSpinBox()
         self.parallel_spin.setRange(2, 16)
         self.parallel_spin.setValue(int(self.settings.get("parallel_downloads") or 8))
@@ -445,12 +535,19 @@ class SettingsPage(QWidget):
         scroll, layout = self._new_scroll_page()
         card = SectionCard("下载行为", "控制版本安装与 Modrinth 下载的默认行为。", "download_cloud")
         source_combo = self._combo([
-            ("auto", "自动选择（推荐）"), ("official", "官方源优先"), ("mirror", "BMCLAPI 镜像优先"),
+            ("auto", "自动选择（推荐）"),
+            ("official_priority", "优先官方源"),
+            ("mirror_priority", "优先 BMCLAPI"),
+            ("official", "仅官方源"),
+            ("mirror_only", "仅 BMCLAPI 镜像"),
         ], str(self.settings.get("download_source") or "auto"))
         source_combo.currentIndexChanged.connect(
-            lambda: self._save("download_source", source_combo.currentData(), "下载源已更新"))
+            lambda: (self._save("download_source", source_combo.currentData(), "下载源已更新"),
+                     self._update_source_warnings()))
         card.add_row(self._setting_row("默认下载源", "影响 Mojang 版本清单、支持库与资源文件的获取。",
                                        source_combo, "globe"))
+        self.source_warnings.append(self._mirror_warning())
+        card.add_widget(self.source_warnings[-1])
         parallel_spin = QSpinBox()
         parallel_spin.setRange(2, 16)
         parallel_spin.setValue(int(self.settings.get("parallel_downloads") or 8))
@@ -632,7 +729,7 @@ class SettingsPage(QWidget):
     def _build_appearance(self) -> QWidget:
         scroll, layout = self._new_scroll_page()
         theme_card = SectionCard(
-            "主题", "全部主题免费开放，切换即生效。", "image")
+            "主题", "", "image")
         note = InfoBanner("选择一套配色，立即应用到整个启动器。", "success", "sparkle")
         theme_card.add_widget(note)
         grid = QGridLayout()
@@ -655,6 +752,8 @@ class SettingsPage(QWidget):
             tile_layout.addWidget(preview)
             name_row = QHBoxLayout()
             name_row.setSpacing(4)
+            theme_icon = BrandMark(theme_id, 18, follow_theme=False)
+            name_row.addWidget(theme_icon)
             name = label(theme.name, "cardTitle")
             name_row.addWidget(name)
             name_row.addStretch()
@@ -729,12 +828,6 @@ class SettingsPage(QWidget):
         actions.addStretch()
         card.add_widget(self._actions_widget(actions))
         layout.addWidget(card)
-        note = InfoCard(
-            "离线与正版",
-            "离线玩家无需联网，适合单人与离线服务器。微软正版登录使用设备代码流程，"
-            "点击一次即可在浏览器完成，无需安装 Azure 工具；登录凭据由构建者或本机 "
-            "oauth.json 提供，启动器不会要求密码，也不会把令牌发送到第三方。")
-        layout.addWidget(note)
         layout.addStretch()
         return scroll
 
@@ -783,32 +876,32 @@ class SettingsPage(QWidget):
             "info")
         materials.add_widget(CreditRow(
             "M", "Minecraft 素材 · Mojang Studios / Microsoft",
-            "应用图标、主题图标与内置 Steve/Alex 皮肤是项目所有者提供的 Minecraft "
+            "应用图标、主题图标、草方块图标与内置 Steve/Alex 皮肤是项目所有者提供的 Minecraft "
             "素材；版权归 Mojang Studios / Microsoft，不适用 GPL。",
-            "", "", "Mojang"))
+            "", "", "Mojang", image_path=icons_dir() / "grass_block.png"))
         materials.add_widget(CreditRow(
             "Q", "PyQt6 / Qt",
-            "界面运行库，GPL-3.0。完整许可证文本见仓库根目录的 LICENSE。",
+            "界面运行库，GPL-3.0，许可证文本见 GNU 官方页面。",
             "", "", "GPL-3.0"))
         materials.add_widget(CreditRow(
             "L", "minecraft-launcher-lib",
-            "仅用于 Forge 官方安装处理器，BSD-2-Clause。许可证见 "
-            "licenses/minecraft-launcher-lib-LICENSE.txt。",
+            "仅用于 Forge 官方安装处理器，BSD-2-Clause。",
             "", "", "BSD-2-Clause"))
-        license_row = QHBoxLayout()
-        license_row.setSpacing(8)
-        third_party = make_button(
-            "查看第三方组件说明", "secondary", "book", "muted", 13)
-        third_party.clicked.connect(
-            lambda: self._open(self.shell.project_dir / "THIRD_PARTY_NOTICES.md"))
-        license_row.addWidget(third_party)
-        local_license = make_button("阅读 GPL-3.0 全文", "ghost", "log", "accent", 13)
-        local_license.clicked.connect(
-            lambda: self._open(self.shell.project_dir / "LICENSE"))
-        license_row.addWidget(local_license)
-        license_row.addStretch()
-        materials.add_widget(self._actions_widget(license_row))
         layout.addWidget(materials)
+
+        project = SectionCard(
+            "项目主页", "源码仓库与发布页。", "link")
+        project.add_widget(CreditRow(
+            "GH", "GitHub",
+            "https://github.com/Heindrich-von-Skalitz/SteampunkHarborLauncher",
+            "打开", "https://github.com/Heindrich-von-Skalitz/SteampunkHarborLauncher",
+            "GitHub"))
+        project.add_widget(CreditRow(
+            "GT", "Gitee",
+            "https://gitee.com/Matinov/SteampunkHarborLauncher",
+            "打开", "https://gitee.com/Matinov/SteampunkHarborLauncher",
+            "Gitee"))
+        layout.addWidget(project)
 
         hero = Card(padding=20, spacing=12)
         top = QHBoxLayout()
@@ -833,10 +926,10 @@ class SettingsPage(QWidget):
         legal.add_widget(CreditRow(
             "©", "启动器原创代码", f"{APP_AUTHOR} · GNU GPL v3。源码随软件一同提供，可查看、修改与再分发。",
             "GNU GPL", "https://www.gnu.org/licenses/gpl-3.0.html", "GPL-3.0"))
-        local_license_button = make_button("阅读本地许可证", "ghost", "book", "accent", 13)
-        local_license_button.clicked.connect(
-            lambda: self._open(self.shell.project_dir / "LICENSE"))
-        legal.add_widget(self._actions_widget(self._button_row(local_license_button)))
+        legal.add_widget(CreditRow(
+            "SHA", "可执行文件 SHA-256", self._executable_hash(),
+            "查询发布页", "https://github.com/Heindrich-von-Skalitz/SteampunkHarborLauncher/releases/",
+            "SHA-256"))
         open_data = make_button("打开", "ghost", "folder", "accent", 13)
         open_data.clicked.connect(lambda: self._open(self.shell.data_dir))
         legal.add_row(SettingRow("启动器数据目录", str(self.shell.data_dir), open_data, "save"))
@@ -875,6 +968,8 @@ class SettingsPage(QWidget):
 
     def set_theme(self, theme: Theme) -> None:
         self.theme = theme
+        for banner in self.source_warnings:
+            banner.set_theme(theme)
         self.refresh_java()
         self.refresh_accounts()
         self.refresh_theme_gallery()

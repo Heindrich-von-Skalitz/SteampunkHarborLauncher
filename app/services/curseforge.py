@@ -114,6 +114,17 @@ class CurseForgeService:
             "project_type": project_type,
         }
 
+    def mods(self, project_ids: list[str]) -> list[dict[str, Any]]:
+        if not project_ids:
+            return []
+        data = request_json(
+            f"{API}/mods", method="POST", timeout=30,
+            json={"modIds": [int(item) for item in project_ids if str(item).isdigit()]},
+            headers=self._headers(), context="读取 CurseForge 前置工程",
+        )
+        items = data.get("data") if isinstance(data, dict) else None
+        return [item for item in (items or []) if isinstance(item, dict)]
+
     def files(self, project_id: str, *, game_version: str = "",
               loader: str = "") -> list[dict[str, Any]]:
         params: dict[str, Any] = {"pageSize": 50}
@@ -165,8 +176,11 @@ class CurseForgeService:
         urls = self.file_urls(file)
         if not urls:
             raise CurseForgeError("CurseForge 没有为这个文件提供下载地址。")
+        sha1 = self.sha1(file)
+        if not sha1:
+            raise CurseForgeError("CurseForge 文件缺少 SHA-1，已拒绝下载。")
         return download_file(
-            urls, destination, sha1=self.sha1(file),
+            urls, destination, sha1=sha1,
             size=int(file.get("fileLength") or 0) or None,
             progress=progress, cancel=cancel,
             context=str(file.get("fileName") or "CurseForge 文件"),

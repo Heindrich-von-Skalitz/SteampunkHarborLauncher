@@ -70,6 +70,7 @@ class ResourceInfo:
     description: str = ""
     icon_path: str = ""
     modified: float = 0.0
+    enabled: bool = False
 
 
 @dataclass
@@ -411,6 +412,7 @@ class ModManager:
         if not folder.exists():
             return []
         result: list[ResourceInfo] = []
+        selected = self.resourcepack_names(version) if kind == "resourcepacks" else set()
         for entry in folder.iterdir():
             try:
                 if entry.is_dir():
@@ -453,11 +455,69 @@ class ModManager:
                     path=entry, name=display_name, kind=kind, size=size,
                     description=description, icon_path=icon_path,
                     modified=entry.stat().st_mtime,
+                    enabled=(kind == "resourcepacks" and (
+                        f"file/{display_name}" in selected or display_name in selected)),
                 ))
             except OSError:
                 continue
         result.sort(key=lambda item: item.name.lower())
         return result
+
+    def _options_path(self, version: InstalledVersion) -> Path:
+        return self.minecraft.game_dir(version) / "options.txt"
+
+    def resourcepack_names(self, version: InstalledVersion) -> set[str]:
+        path = self._options_path(version)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return set()
+        for line in lines:
+            if not line.startswith("resourcePacks:"):
+                continue
+            raw = line.split(":", 1)[1].strip()
+            try:
+                values = json.loads(raw)
+            except ValueError:
+                return set()
+            if isinstance(values, list):
+                return {str(value) for value in values}
+        return set()
+
+    def set_resourcepack_enabled(self, version: InstalledVersion, resource: ResourceInfo,
+                                 enabled: bool) -> None:
+        path = self._options_path(version)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        key = f"file/{resource.name}"
+        names = self.resourcepack_names(version)
+        if enabled:
+            names.add(key)
+        else:
+            names.discard(key)
+            names.discard(resource.name)
+        value = "resourcePacks:" + json.dumps(sorted(names), ensure_ascii=False,
+                                               separators=(",", ":"))
+        replaced = False
+        for index, line in enumerate(lines):
+            if line.startswith("resourcePacks:"):
+                lines[index] = value
+                replaced = True
+                break
+        if not replaced:
+            lines.append(value)
+        temp_path = path.with_name(path.name + ".tmp")
+        try:
+            temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.replace(temp_path, path)
+        except OSError as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise LauncherError(f"无法写入 options.txt：{exc}") from exc
 
     def open_mods_folder(self, version: InstalledVersion) -> Path:
         folder = self.minecraft.mods_dir(version, create=True)

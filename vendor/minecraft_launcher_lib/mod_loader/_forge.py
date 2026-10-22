@@ -15,7 +15,20 @@ import shutil
 import json
 import os
 
+import requests
+
 _MAVEN_METADATA_URL = "https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml"
+
+
+def _remote_sha1(url: str) -> str:
+    """Fetch the official Maven .sha1 sidecar; refuse empty/invalid values."""
+    try:
+        response = requests.get(url + ".sha1", timeout=20)
+        response.raise_for_status()
+        value = response.text.strip().split()[0].lower()
+        return value if len(value) == 40 else ""
+    except Exception:
+        return ""
 
 
 class Forge(ModLoaderBase):
@@ -122,7 +135,11 @@ class Forge(ModLoaderBase):
         with tempfile.TemporaryDirectory(prefix="minecraft-launcher-lib-") as tempdir:
             installer_path = os.path.join(tempdir, "installer.jar")
 
-            download_file(forge_installer_url, installer_path, callback)
+            installer_sha1 = _remote_sha1(forge_installer_url)
+            if not installer_sha1:
+                raise RuntimeError("Forge installer hash is unavailable")
+            download_file(forge_installer_url, installer_path, callback,
+                          sha1=installer_sha1)
 
             with zipfile.ZipFile(installer_path, "r") as zf:
                 # Read the install_profile.json
